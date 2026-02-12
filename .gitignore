@@ -1,0 +1,15 @@
+# Browser Extension
+*.crx
+*.pem
+*.zip
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log

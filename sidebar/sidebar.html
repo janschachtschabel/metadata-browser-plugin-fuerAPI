@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WLO Metadaten-Agent</title>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons">
+    <link rel="stylesheet" href="../webcomponent/styles.css">
+    <link rel="stylesheet" href="sidebar.css">
+</head>
+<body>
+    <div class="sidebar-container">
+        <!-- Navigation Tabs -->
+        <nav class="nav-tabs">
+            <button class="nav-tab active" data-view="main">
+                <span class="material-icons">school</span>
+                <span class="nav-tab-label">Start</span>
+            </button>
+            <button class="nav-tab" data-view="queue">
+                <span class="material-icons">bookmark</span>
+                <span class="nav-tab-label">Merkliste</span>
+                <span id="queue-badge" class="nav-badge hidden">0</span>
+            </button>
+            <button class="nav-tab" data-view="history">
+                <span class="material-icons">history</span>
+                <span class="nav-tab-label">Verlauf</span>
+            </button>
+            <button class="nav-tab" data-view="warenkorb">
+                <span class="material-icons">shopping_cart</span>
+                <span class="nav-tab-label">Warenkorb</span>
+            </button>
+        </nav>
+
+        <!-- Main Content Area -->
+        <main class="sidebar-content">
+
+            <!-- ========== MAIN VIEW (Login & Start) ========== -->
+            <div id="main-view" class="view-container active">
+                <!-- Logged In State -->
+                <div id="logged-in-state" class="state-container hidden">
+                    <div class="user-card">
+                        <div class="user-info">
+                            <span class="material-icons user-icon">account_circle</span>
+                            <div>
+                                <div class="user-label">Angemeldet als</div>
+                                <div class="user-name" id="user-name-display"></div>
+                            </div>
+                        </div>
+                        <button id="logout-btn" class="btn-text" title="Abmelden">
+                            <span class="material-icons">logout</span>
+                            <span>Abmelden</span>
+                        </button>
+                    </div>
+
+                    <div class="action-card">
+                        <h2>Erschließung starten</h2>
+                        <p>Metadaten der aktuellen Seite per KI erfassen und im Repository speichern.</p>
+                        <button id="start-logged-btn" class="btn btn-primary btn-large">
+                            <span class="material-icons">play_arrow</span>
+                            <span>Erschließung starten</span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Guest State -->
+                <div id="guest-state" class="state-container">
+                    <div class="login-hero">
+                        <img src="../images/wlo_owl.png" alt="WirLernenOnline Eule" class="hero-owl">
+                        <img src="../images/logo.svg" alt="WirLernenOnline" class="hero-logo">
+                    </div>
+                    <div class="login-card">
+                        <h2>Anmelden für direkten Upload</h2>
+                        <form id="login-form" class="login-form">
+                            <div class="form-row">
+                                <div class="form-field md3-field">
+                                    <input type="text" id="username" class="form-input" autocomplete="username" required>
+                                    <label for="username">Benutzername</label>
+                                </div>
+                                <div class="form-field md3-field">
+                                    <input type="password" id="password" class="form-input" autocomplete="current-password" required>
+                                    <label for="password">Passwort</label>
+                                </div>
+                            </div>
+                            <button type="submit" class="btn btn-tonal">
+                                <span class="material-icons">lock</span>
+                                <span>Anmelden</span>
+                            </button>
+                        </form>
+                    </div>
+
+                    <div class="action-card">
+                        <h2>Als Gast erschließen</h2>
+                        <p>Metadaten der aktuellen Seite erfassen und zur Prüfung einreichen.</p>
+                        <button id="start-guest-btn" class="btn btn-primary btn-large">
+                            <span class="material-icons">play_arrow</span>
+                            <span>Erschließung starten</span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- How it works -->
+                <div class="info-card">
+                    <h3><span class="material-icons">lightbulb</span> So funktioniert's</h3>
+                    <ol class="steps-list">
+                        <li>Öffne eine Webseite mit Bildungsmaterial</li>
+                        <li>Klicke auf „Erschließung starten"</li>
+                        <li>Metadaten werden per KI extrahiert</li>
+                        <li>Prüfe und ergänze die Metadaten</li>
+                        <li>Upload ins WLO-Repository (User oder Gast)</li>
+                    </ol>
+                    <h3 style="margin-top: 16px;"><span class="material-icons">shopping_cart</span> Warenkorb</h3>
+                    <ol class="steps-list">
+                        <li>Wechsle zum Warenkorb-Tab</li>
+                        <li>Wähle Thema, Fach und Bildungsstufe</li>
+                        <li>Nutze „Auto-Füllen" oder suche auf WLO</li>
+                        <li>Klicke 🛒 auf den Kacheln bei wirlernenonline.de</li>
+                        <li>Erstelle einen druckbaren Unterrichtsentwurf</li>
+                    </ol>
+                </div>
+            </div>
+
+            <!-- ========== QUEUE VIEW ========== -->
+            <div id="queue-view" class="view-container">
+                <div class="view-header">
+                    <h2>Merkliste</h2>
+                    <p class="view-subtitle">Vorgemerkte Seiten zur späteren Erschließung</p>
+                    <div class="search-box">
+                        <span class="material-icons">search</span>
+                        <input type="text" id="queue-search" placeholder="Suchen..." class="search-input">
+                    </div>
+                </div>
+                <div id="queue-stats" class="stats-cards"></div>
+                <div id="queue-empty" class="empty-state">
+                    <span class="material-icons empty-icon">bookmark_border</span>
+                    <h3>Keine Seiten vorgemerkt</h3>
+                    <p class="empty-subtitle">Rechtsklick → "Zur Merkliste hinzufügen"</p>
+                    <button id="add-current-page-btn" class="btn btn-primary">
+                        <span class="material-icons">add</span>
+                        <span>Aktuelle Seite hinzufügen</span>
+                    </button>
+                </div>
+                <div id="queue-content" class="content-area hidden">
+                    <div id="queue-list" class="item-list"></div>
+                    <div class="action-bar">
+                        <button id="add-current-page-filled-btn" class="btn btn-primary btn-small">
+                            <span class="material-icons">add</span>
+                            <span>Aktuelle Seite</span>
+                        </button>
+                        <div class="action-bar-secondary">
+                            <button id="queue-export-btn" class="btn-text">
+                                <span class="material-icons">download</span>
+                                <span>Export</span>
+                            </button>
+                            <button id="queue-clear-btn" class="btn-text">
+                                <span class="material-icons">delete_sweep</span>
+                                <span>Alle löschen</span>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ========== HISTORY VIEW ========== -->
+            <div id="history-view" class="view-container">
+                <div class="view-header">
+                    <h2>Verlauf</h2>
+                    <p class="view-subtitle">Bereits erschlossene Inhalte</p>
+                    <div class="search-box">
+                        <span class="material-icons">search</span>
+                        <input type="text" id="history-search" placeholder="Suchen..." class="search-input">
+                    </div>
+                </div>
+                <div id="history-stats" class="stats-cards"></div>
+                <div id="history-empty" class="empty-state">
+                    <span class="material-icons empty-icon">history</span>
+                    <h3>Kein Verlauf vorhanden</h3>
+                    <p>Erschlossene Inhalte werden hier angezeigt</p>
+                </div>
+                <div id="history-content" class="content-area hidden">
+                    <div id="history-list" class="item-list"></div>
+                    <div class="action-bar">
+                        <button id="history-export-btn" class="btn-text">
+                            <span class="material-icons">download</span>
+                            <span>Export</span>
+                        </button>
+                        <button id="history-clear-btn" class="btn-text">
+                            <span class="material-icons">delete_sweep</span>
+                            <span>Verlauf löschen</span>
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ========== WARENKORB VIEW ========== -->
+            <div id="warenkorb-view" class="view-container">
+                <!-- Header -->
+                <div class="view-header">
+                    <h2><span class="material-icons" style="vertical-align:middle;margin-right:6px;">shopping_cart</span>Pädagogischer Warenkorb</h2>
+                    <p class="view-subtitle">Unterrichtsplanung mit WLO-Inhalten</p>
+                </div>
+
+                <!-- WLO Search -->
+                <div class="wk-global-search">
+                    <div class="search-box" style="margin-top:0">
+                        <span class="material-icons">search</span>
+                        <input type="text" id="wk-global-search-input" placeholder="In WirLernenOnline suchen…" class="search-input">
+                    </div>
+                    <button id="wk-global-search-btn" class="btn btn-tonal btn-small" style="margin-top:8px;">
+                        <span class="material-icons">open_in_new</span>
+                        <span>WLO-Suche öffnen</span>
+                    </button>
+                </div>
+
+                <!-- Metadata -->
+                <div class="wk-meta-card">
+                    <div class="wk-meta-row">
+                        <div class="wk-meta-field wk-meta-field-wide">
+                            <label for="wk-meta-title">Thema / Titel</label>
+                            <input type="text" id="wk-meta-title" placeholder="z.B. Klimawandel">
+                        </div>
+                    </div>
+                    <div class="wk-meta-row">
+                        <div class="wk-meta-field">
+                            <label for="wk-filter-discipline">Fach</label>
+                            <select id="wk-filter-discipline">
+                                <!-- Populated from WK_DISCIPLINES in warenkorb.js -->
+                            </select>
+                        </div>
+                        <div class="wk-meta-field">
+                            <label for="wk-filter-educontext">Bildungsstufe</label>
+                            <select id="wk-filter-educontext">
+                                <!-- Populated from WK_EDU_CONTEXTS in warenkorb.js -->
+                            </select>
+                        </div>
+                    </div>
+                    <div class="wk-meta-row">
+                        <div class="wk-meta-field">
+                            <label for="wk-meta-duration">Dauer</label>
+                            <input type="text" id="wk-meta-duration" placeholder="z.B. 90 min">
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Pattern Selector -->
+                <div class="wk-pattern-bar">
+                    <label for="wk-pattern-select">Ablaufmuster</label>
+                    <select id="wk-pattern-select">
+                        <option value="frontalunterricht">Frontalunterricht</option>
+                        <option value="problemorientiert">Problemorientiertes Lernen</option>
+                        <option value="stationenlernen">Stationenlernen</option>
+                        <option value="flippedClassroom">Flipped Classroom</option>
+                        <option value="direkteInstruktion">Direkte Instruktion</option>
+                        <option value="kooperativesLernen">Kooperatives Lernen</option>
+                        <option value="forschendesLernen">Forschendes Lernen</option>
+                    </select>
+                </div>
+
+                <!-- Phases -->
+                <div id="wk-phases" class="wk-phases-container">
+                    <!-- Dynamically rendered by warenkorb.js -->
+                </div>
+
+                <!-- Differentiation -->
+                <div class="wk-diff-section">
+                    <div class="wk-diff-label">Binnendifferenzierung</div>
+                    <div class="wk-diff-chips">
+                        <span class="wk-diff-chip" data-diff-id="basis" data-diff-hint="Grundlegende Aufgaben, mehr Hilfestellung">Basis</span>
+                        <span class="wk-diff-chip" data-diff-id="standard" data-diff-hint="Regelanforderungen">Standard</span>
+                        <span class="wk-diff-chip" data-diff-id="erweitert" data-diff-hint="Vertiefende, komplexere Aufgaben">Erweitert</span>
+                        <span class="wk-diff-chip" data-diff-id="lrs" data-diff-hint="Lese-Rechtschreib-Schwäche">LRS</span>
+                        <span class="wk-diff-chip" data-diff-id="adhs" data-diff-hint="Klare Struktur, kürzere Einheiten">ADHS</span>
+                        <span class="wk-diff-chip" data-diff-id="daz" data-diff-hint="Deutsch als Zweitsprache">DaZ</span>
+                        <span class="wk-diff-chip" data-diff-id="hochbegabung" data-diff-hint="Enrichment, komplexere Aufgaben">Hochbegabung</span>
+                    </div>
+                </div>
+
+                <!-- Footer Actions -->
+                <div class="wk-footer-actions">
+                    <button id="wk-clear-btn" class="btn btn-text btn-small">
+                        <span class="material-icons">delete_sweep</span>
+                        <span>Leeren</span>
+                    </button>
+                    <button id="wk-autofill-btn" class="btn btn-tonal btn-small">
+                        <span class="material-icons">auto_awesome</span>
+                        <span>Auto-Füllen</span>
+                    </button>
+                    <button id="wk-print-btn" class="btn btn-primary btn-small">
+                        <span class="material-icons">print</span>
+                        <span>Drucken / PDF</span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- ========== CANVAS VIEW (Direct Web Component) ========== -->
+            <div id="canvas-view" class="view-container">
+                <div class="canvas-header">
+                    <button id="canvas-back-btn" class="btn-text">
+                        <span class="material-icons">arrow_back</span>
+                        <span>Zurück</span>
+                    </button>
+                    <div class="canvas-title">
+                        <span class="material-icons">edit_note</span>
+                        <span id="canvas-page-title">Seite erschließen</span>
+                    </div>
+                </div>
+
+                <div id="canvas-container" class="canvas-component-container">
+                    <!-- The Angular web component is mounted here directly — no iframe! -->
+                    <metadata-agent-canvas
+                        id="metadata-canvas"
+                        layout="plugin"
+                        api-url="https://metadata-agent-api.vercel.app"
+                        highlight-ai="false"
+                        language="de"
+                        show-status-bar="false"
+                        show-upload-button="false"
+                        show-page-mode="true"
+                    ></metadata-agent-canvas>
+                </div>
+            </div>
+
+        </main>
+
+        <!-- Loading Overlay -->
+        <div id="loading-overlay" class="loading-overlay hidden">
+            <div class="spinner"></div>
+            <p id="loading-text">Laden...</p>
+        </div>
+    </div>
+
+    <!-- Web Component Scripts (Angular Elements — no iframe needed) -->
+    <script src="../webcomponent/runtime.js"></script>
+    <script src="../webcomponent/polyfills.js"></script>
+    <script src="../webcomponent/main.js"></script>
+
+    <!-- Plugin Scripts -->
+    <script src="../config.js"></script>
+    <script src="warenkorb-patterns.js"></script>
+    <script src="warenkorb-api.js"></script>
+    <script src="warenkorb.js"></script>
+    <script src="sidebar.js"></script>
+</body>
+</html>

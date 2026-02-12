@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WLO Metadaten-Agent - Einstellungen</title>
+    <link rel="stylesheet" href="options.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Header mit Logo -->
+        <header class="header">
+            <div class="logo-container">
+                <img src="../images/wlo_owl.png" alt="WLO Eule" class="logo">
+            </div>
+            <h1>Wir lernen online</h1>
+            <p class="subtitle">Metadaten-Agent v7 - Einstellungen</p>
+        </header>
+
+        <!-- Login Section -->
+        <section class="card">
+            <div class="card-header">
+                <h2>🔐 Anmeldung</h2>
+                <p class="card-description">Melde dich mit deinem WLO-Account an, um Inhalte direkt in dein Home-Verzeichnis hochzuladen.</p>
+            </div>
+
+            <div class="card-content">
+                <!-- Login Status -->
+                <div id="login-status" class="status-box hidden">
+                    <div class="status-icon">✅</div>
+                    <div class="status-content">
+                        <p class="status-title">Angemeldet als:</p>
+                        <p class="status-username" id="username-display"></p>
+                    </div>
+                </div>
+
+                <!-- Login Form -->
+                <form id="login-form">
+                    <div class="form-group">
+                        <label for="username" class="form-label">Benutzername</label>
+                        <input 
+                            type="text" 
+                            id="username" 
+                            name="username" 
+                            class="form-input"
+                            placeholder="dein.name"
+                            autocomplete="username"
+                            required
+                        >
+                    </div>
+
+                    <div class="form-group">
+                        <label for="password" class="form-label">Passwort</label>
+                        <input 
+                            type="password" 
+                            id="password" 
+                            name="password" 
+                            class="form-input"
+                            placeholder="••••••••"
+                            autocomplete="current-password"
+                            required
+                        >
+                    </div>
+
+                    <div class="form-actions">
+                        <button type="submit" class="btn btn-primary" id="login-btn">
+                            <span class="btn-icon">🔓</span>
+                            <span class="btn-text">Anmelden</span>
+                        </button>
+                        <button type="button" class="btn btn-secondary hidden" id="logout-btn">
+                            <span class="btn-icon">🔒</span>
+                            <span class="btn-text">Abmelden</span>
+                        </button>
+                    </div>
+                </form>
+
+                <!-- Guest Mode Info -->
+                <div class="info-box">
+                    <p class="info-title">💡 Gast-Modus</p>
+                    <p class="info-text">
+                        Ohne Anmeldung werden Inhalte zur Redaktionsprüfung eingereicht.
+                        Mit Anmeldung landen sie direkt in deinem Home-Verzeichnis.
+                    </p>
+                </div>
+            </div>
+        </section>
+
+        <!-- Repository Settings -->
+        <section class="card">
+            <div class="card-header">
+                <h2>⚙️ Repository-Einstellungen</h2>
+                <p class="card-description">Konfiguration des WLO Repositories</p>
+            </div>
+
+            <div class="card-content">
+                <div class="form-group">
+                    <label for="repository-url" class="form-label">Repository URL</label>
+                    <input 
+                        type="url" 
+                        id="repository-url" 
+                        class="form-input"
+                        value="https://repository.staging.openeduhub.net"
+                        placeholder="https://repository.staging.openeduhub.net"
+                    >
+                    <p class="form-help">Ziel-Repository (Standard: OpenEduHub Staging)</p>
+                </div>
+                <div class="form-actions" style="margin-top: 16px;">
+                    <button type="button" class="btn btn-primary btn-small" id="save-repo-url-btn">
+                        <span class="btn-icon">💾</span>
+                        <span class="btn-text">Speichern</span>
+                    </button>
+                    <button type="button" class="btn btn-secondary btn-small" id="reset-repo-url-btn">
+                        <span class="btn-icon">↺</span>
+                        <span class="btn-text">Zurücksetzen</span>
+                    </button>
+                </div>
+
+                <div class="permissions-box hidden" id="permissions-box">
+                    <p class="permissions-title">🎫 Berechtigungen:</p>
+                    <ul id="permissions-list" class="permissions-list"></ul>
+                </div>
+            </div>
+        </section>
+
+        <!-- API Settings -->
+        <section class="card">
+            <div class="card-header">
+                <h2>🤖 Metadata Agent API</h2>
+                <p class="card-description">FastAPI-Backend für KI-gestützte Metadaten-Extraktion</p>
+            </div>
+
+            <div class="card-content">
+                <div class="form-group">
+                    <label for="api-url" class="form-label">API URL</label>
+                    <input 
+                        type="url" 
+                        id="api-url" 
+                        class="form-input"
+                        value="https://metadata-agent-api.vercel.app"
+                        placeholder="https://metadata-agent-api.vercel.app"
+                    >
+                    <p class="form-help">FastAPI-Backend (Standard: Vercel Deployment, Lokal: http://localhost:8000)</p>
+                </div>
+                <div class="form-actions" style="margin-top: 16px;">
+                    <button type="button" class="btn btn-primary btn-small" id="save-api-url-btn">
+                        <span class="btn-icon">💾</span>
+                        <span class="btn-text">Speichern</span>
+                    </button>
+                    <button type="button" class="btn btn-secondary btn-small" id="reset-api-url-btn">
+                        <span class="btn-icon">↺</span>
+                        <span class="btn-text">Zurücksetzen</span>
+                    </button>
+                </div>
+
+                <div class="info-box" style="margin-top: 16px;">
+                    <p class="info-title">ℹ️ Architektur v7</p>
+                    <p class="info-text">
+                        Die Webkomponente ist direkt im Plugin eingebettet (kein iframe).
+                        Metadaten-Extraktion läuft über die FastAPI, Upload über das Plugin.
+                    </p>
+                </div>
+
+                <div class="feature-list">
+                    <div class="feature-item">
+                        <span class="feature-icon">🤖</span>
+                        <span class="feature-text">KI-gestützte Metadaten-Extraktion (FastAPI)</span>
+                    </div>
+                    <div class="feature-item">
+                        <span class="feature-icon">�</span>
+                        <span class="feature-text">Eingebettete Webkomponente (kein iframe)</span>
+                    </div>
+                    <div class="feature-item">
+                        <span class="feature-icon">🎯</span>
+                        <span class="feature-text">WLO-Taxonomie + Vokabulare</span>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Error Display -->
+        <div id="error-box" class="error-box hidden">
+            <div class="error-icon">❌</div>
+            <p class="error-message" id="error-message"></p>
+        </div>
+
+        <!-- Success Display -->
+        <div id="success-box" class="success-box hidden">
+            <div class="success-icon">✅</div>
+            <p class="success-message" id="success-message"></p>
+        </div>
+
+        <!-- Footer -->
+        <footer class="footer">
+            <div class="footer-links">
+                <a href="https://wirlernenonline.de/" target="_blank" class="footer-link">
+                    🏠 WLO Startseite
+                </a>
+                <span class="separator">•</span>
+                <a href="https://wirlernenonline.de/faq/" target="_blank" class="footer-link">
+                    ❓ Hilfe
+                </a>
+                <span class="separator">•</span>
+                <a href="https://github.com/wirlernenonline" target="_blank" class="footer-link">
+                    💻 GitHub
+                </a>
+            </div>
+            <p class="footer-version">Version 7.0.0</p>
+        </footer>
+    </div>
+
+    <script src="../config.js"></script>
+    <script src="options.js"></script>
+</body>
+</html>
