@@ -1,18 +1,14 @@
 // WLO Metadaten-Agent - Background Service Worker
-// VERSION: 7.1.0 — VCARD author, obeyMds=false, geo extraction, aspects
+// VERSION: 8.0.0 — Aligned with API upload logic: repo_field filtering, field-by-field fallback, guest via API
 // Upload logic handles flat metadata format from FastAPI/web component
-console.log('🚀 WLO Background Service Worker v7 loaded');
+console.log('🚀 WLO Background Service Worker v8 loaded');
 
 // ===========================================================================
 // CONFIGURATION
 // ===========================================================================
 
+const API_URL = 'https://metadata-agent-api.vercel.app';
 const REPOSITORY_URL = 'https://repository.staging.openeduhub.net';
-const GUEST_INBOX_ID = '21144164-30c0-4c01-ae16-264452197063';
-const GUEST_CREDENTIALS = {
-    username: 'WLO-Upload',
-    password: 'wlo#upload!20'
-};
 
 const MAX_QUEUE_SIZE = 100;
 const MAX_HISTORY_SIZE = 100;
@@ -99,6 +95,21 @@ function ensureArray(value, defaultValue = []) {
     return [value];
 }
 
+// Flatten complex objects to simple values (aligned with API _flatten_value)
+function flattenValue(item) {
+    if (item === null || item === undefined) return null;
+    if (typeof item === 'string' || typeof item === 'number' || typeof item === 'boolean') return item;
+    if (typeof item === 'object') {
+        if ('uri' in item) return item.uri;
+        if ('name' in item) return item.name;
+        if ('label' in item) return item.label;
+        if ('@value' in item) return item['@value'];
+        if ('value' in item) return item.value;
+        return JSON.stringify(item);
+    }
+    return String(item);
+}
+
 function getFieldValue(metadata, key) {
     const val = metadata[key];
     if (val === null || val === undefined) return null;
@@ -116,15 +127,15 @@ function getSingleValue(metadata, key) {
 // Fields that are set during node creation (not in metadata update)
 const ESSENTIAL_FIELDS = ['cclom:title', 'cclom:general_description', 'cclom:general_keyword', 'ccm:wwwurl', 'cclom:general_language'];
 
-// Internal/meta keys to skip
+// Internal/meta keys to skip (aligned with API _normalize_for_repo)
 function isInternalKey(key) {
     if (key.startsWith('_')) return true;
     if (['contextName', 'schemaVersion', 'metadataset', 'language', 'exportedAt', 'processing'].includes(key)) return true;
-    if (key.startsWith('virtual:') || key.startsWith('sys:') || key.startsWith('preview:')) return true;
+    if (key.startsWith('virtual:') || key.startsWith('schema:') || key.startsWith('sys:') || key.startsWith('preview:')) return true;
     return false;
 }
 
-function buildAdditionalMetadata(metadata) {
+function buildAdditionalMetadata(metadata, repoFieldIds = null) {
     const result = {};
 
     for (const [key, value] of Object.entries(metadata)) {
@@ -132,13 +143,22 @@ function buildAdditionalMetadata(metadata) {
         if (ESSENTIAL_FIELDS.includes(key)) continue;
         if (key === 'ccm:linktype') continue;
 
+        // If repo_field IDs provided, only include whitelisted fields (aligned with API)
+        if (repoFieldIds && !repoFieldIds.has(key)) continue;
+
         const fieldValue = getFieldValue(metadata, key);
         if (fieldValue === null || fieldValue === undefined) continue;
 
-        // Normalize to array for edu-sharing API
-        const normalized = ensureArray(fieldValue);
-        if (normalized.length > 0) {
-            result[key] = normalized;
+        // Normalize to array and flatten complex objects (aligned with API _normalize_for_repo)
+        const arr = ensureArray(fieldValue);
+        const flattened = [];
+        for (const item of arr) {
+            if (item === null || item === undefined || item === '') continue;
+            const flat = flattenValue(item);
+            if (flat !== null && flat !== undefined) flattened.push(flat);
+        }
+        if (flattened.length > 0) {
+            result[key] = flattened;
         }
     }
 
@@ -154,25 +174,57 @@ function buildAdditionalMetadata(metadata) {
     return result;
 }
 
+// Valid edu-sharing license keys
+const VALID_LICENSE_KEYS = new Set([
+    'NONE', 'CC_0', 'CC0', 'CC_BY', 'CC BY', 'CC_BY_SA', 'CC BY-SA',
+    'CC_BY_ND', 'CC BY-ND', 'CC_BY_NC', 'CC BY-NC',
+    'CC_BY_NC_SA', 'CC BY-NC-SA', 'CC_BY_NC_ND', 'CC BY-NC-ND',
+    'PDM', 'CUSTOM', 'SCHULFUNK', 'UNTERRICHTS_UND_LEHRMEDIEN',
+    'COPYRIGHT_FREE', 'COPYRIGHT_LICENSE'
+]);
+
 function applyLicenseTransform(result, originalMetadata) {
     const customLicense = getSingleValue(originalMetadata, 'ccm:custom_license');
     if (customLicense && typeof customLicense === 'string') {
-        const token = customLicense.substring(customLicense.lastIndexOf('/') + 1);
-        if (token) {
-            if (token.endsWith('_40')) {
-                result['ccm:commonlicense_key'] = [token.slice(0, -3)];
-                result['ccm:commonlicense_cc_version'] = ['4.0'];
-            } else if (token === 'OTHER') {
+        // Only transform if it looks like a URI (contains '/')
+        if (customLicense.includes('/')) {
+            const token = customLicense.substring(customLicense.lastIndexOf('/') + 1);
+            if (token) {
+                if (token.endsWith('_40')) {
+                    result['ccm:commonlicense_key'] = [token.slice(0, -3)];
+                    result['ccm:commonlicense_cc_version'] = ['4.0'];
+                } else if (token === 'OTHER') {
+                    result['ccm:commonlicense_key'] = ['CUSTOM'];
+                } else if (VALID_LICENSE_KEYS.has(token)) {
+                    result['ccm:commonlicense_key'] = [token];
+                }
+            }
+            // Remove the URI (it was transformed)
+            delete result['ccm:custom_license'];
+        } else {
+            // Plain text → keep as custom license, set key to CUSTOM
+            if (!result['ccm:commonlicense_key']) {
                 result['ccm:commonlicense_key'] = ['CUSTOM'];
-            } else {
-                result['ccm:commonlicense_key'] = [token];
             }
         }
-        delete result['ccm:custom_license'];
     }
 
-    if (result['ccm:commonlicense_key'] && !result['ccm:commonlicense_cc_version']) {
-        result['ccm:commonlicense_cc_version'] = ['4.0'];
+    // Validate ccm:commonlicense_key against known keys
+    if (result['ccm:commonlicense_key']?.length) {
+        const key = String(result['ccm:commonlicense_key'][0]).trim();
+        if (!VALID_LICENSE_KEYS.has(key)) {
+            console.warn(`⚠️ Invalid license key removed: ${key.substring(0, 80)}`);
+            delete result['ccm:commonlicense_key'];
+            delete result['ccm:commonlicense_cc_version'];
+        }
+    }
+
+    // Default CC version only for CC-type licenses
+    if (result['ccm:commonlicense_key']?.length && !result['ccm:commonlicense_cc_version']) {
+        const key = String(result['ccm:commonlicense_key'][0]);
+        if (key.startsWith('CC')) {
+            result['ccm:commonlicense_cc_version'] = ['4.0'];
+        }
     }
 
     return result;
@@ -241,6 +293,179 @@ function extractGeoCoordinates(result, metadata) {
             result['cm:longitude'] = [String(lon)];
             console.log(`📍 Geo (top-level): ${lat}, ${lon}`);
         }
+    }
+}
+
+// ===========================================================================
+// FETCH REPO FIELD IDS FROM API (aligned with API get_repo_fields)
+// ===========================================================================
+
+async function fetchRepoFieldIds(metadata) {
+    const context = metadata.contextName || 'default';
+    const version = metadata.schemaVersion || 'latest';
+    const schemaFile = metadata.metadataset || null;
+
+    const fieldIds = new Set();
+
+    // Always load core.json fields
+    try {
+        const coreResp = await fetch(`${API_URL}/info/schema/${context}/${version}/core.json`);
+        if (coreResp.ok) {
+            const coreSchema = await coreResp.json();
+            for (const field of (coreSchema.fields || [])) {
+                if (field.system?.repo_field) {
+                    const id = field.system?.path || field.id;
+                    if (id) fieldIds.add(id);
+                }
+            }
+        }
+    } catch (e) {
+        console.warn('⚠️ Failed to load core.json repo fields:', e);
+    }
+
+    // Load special schema fields (e.g. event.json)
+    if (schemaFile) {
+        try {
+            const schemaResp = await fetch(`${API_URL}/info/schema/${context}/${version}/${schemaFile}`);
+            if (schemaResp.ok) {
+                const schema = await schemaResp.json();
+                for (const field of (schema.fields || [])) {
+                    if (field.system?.repo_field) {
+                        const id = field.system?.path || field.id;
+                        if (id) fieldIds.add(id);
+                    }
+                }
+            }
+        } catch (e) {
+            console.warn(`⚠️ Failed to load ${schemaFile} repo fields:`, e);
+        }
+    }
+
+    console.log(`📋 Repo fields from schema: ${fieldIds.size} fields`);
+    return fieldIds.size > 0 ? fieldIds : null;
+}
+
+// ===========================================================================
+// SET METADATA WITH FIELD-BY-FIELD FALLBACK (aligned with API _set_metadata)
+// ===========================================================================
+
+async function setMetadataWithFallback(nodeId, metadataToSet, authHeader) {
+    const metadataUrl = `${REPOSITORY_URL}/edu-sharing/rest/node/v1/nodes/-home-/${nodeId}/metadata?versionComment=METADATA_UPDATE&obeyMds=false`;
+    const fieldCount = Object.keys(metadataToSet).length;
+
+    // Strategy 1: Bulk update
+    const bulkResp = await fetch(metadataUrl, {
+        method: 'POST',
+        headers: { 'Authorization': authHeader, 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify(metadataToSet)
+    });
+
+    if (bulkResp.ok) {
+        console.log(`✅ Bulk metadata update succeeded: ${fieldCount} fields`);
+        return { success: true, fields_written: fieldCount, fields_skipped: 0, field_errors: [] };
+    }
+
+    // Strategy 2: Field-by-field fallback
+    console.warn(`⚠️ Bulk metadata update failed (${bulkResp.status}), retrying field-by-field...`);
+    let fieldsWritten = 0;
+    let fieldsSkipped = 0;
+    const fieldErrors = [];
+
+    for (const [fieldId, fieldValue] of Object.entries(metadataToSet)) {
+        try {
+            const singleResp = await fetch(metadataUrl, {
+                method: 'POST',
+                headers: { 'Authorization': authHeader, 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                credentials: 'include',
+                body: JSON.stringify({ [fieldId]: fieldValue })
+            });
+
+            if (singleResp.ok) {
+                fieldsWritten++;
+            } else {
+                fieldsSkipped++;
+                const errText = (await singleResp.text()).substring(0, 200);
+                fieldErrors.push({ field_id: fieldId, error: `HTTP ${singleResp.status}: ${errText}` });
+                console.log(`   ❌ ${fieldId}: ${singleResp.status}`);
+            }
+        } catch (e) {
+            fieldsSkipped++;
+            fieldErrors.push({ field_id: fieldId, error: String(e) });
+            console.log(`   ❌ ${fieldId}: ${e}`);
+        }
+    }
+
+    console.log(`📊 Field-by-field result: ${fieldsWritten} written, ${fieldsSkipped} failed`);
+    return { success: fieldsWritten > 0, fields_written: fieldsWritten, fields_skipped: fieldsSkipped, field_errors: fieldErrors };
+}
+
+// ===========================================================================
+// COLLECTION SUPPORT (aligned with API _set_collections)
+// ===========================================================================
+
+function extractCollectionIds(metadata) {
+    const ids = [];
+
+    const primary = metadata['virtual:collection_id_primary'];
+    if (primary) ids.push(extractIdFromUrl(primary));
+
+    const additional = metadata['ccm:collection_id'];
+    if (Array.isArray(additional)) {
+        for (const coll of additional) ids.push(extractIdFromUrl(coll));
+    }
+
+    return ids.filter(Boolean);
+}
+
+function extractIdFromUrl(value) {
+    if (typeof value === 'string' && value.includes('/')) return value.split('/').pop();
+    return value ? String(value) : '';
+}
+
+async function setCollections(nodeId, collectionIds, authHeader) {
+    for (const collectionId of collectionIds) {
+        try {
+            const resp = await fetch(
+                `${REPOSITORY_URL}/edu-sharing/rest/collection/v1/collections/-home-/${collectionId}/references/${nodeId}`,
+                {
+                    method: 'PUT',
+                    headers: { 'Authorization': authHeader, 'Accept': 'application/json' },
+                    credentials: 'include'
+                }
+            );
+            if (resp.ok) console.log(`📂 Added to collection: ${collectionId}`);
+            else console.warn(`⚠️ Collection ${collectionId} failed: ${resp.status}`);
+        } catch (e) {
+            console.warn(`⚠️ Collection ${collectionId} error:`, e);
+        }
+    }
+}
+
+// ===========================================================================
+// START REVIEW WORKFLOW (aligned with API _start_workflow)
+// ===========================================================================
+
+async function startWorkflow(nodeId, authHeader) {
+    try {
+        const resp = await fetch(
+            `${REPOSITORY_URL}/edu-sharing/rest/node/v1/nodes/-home-/${nodeId}/workflow`,
+            {
+                method: 'PUT',
+                headers: { 'Authorization': authHeader, 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                credentials: 'include',
+                body: JSON.stringify({
+                    receiver: [{ authorityName: 'GROUP_ORG_WLO-Uploadmanager' }],
+                    comment: 'Upload via Browser Plugin',
+                    status: '200_tocheck',
+                    logLevel: 'info'
+                })
+            }
+        );
+        if (resp.ok) console.log('🚀 Workflow started');
+        else console.warn(`⚠️ Workflow failed: ${resp.status}`);
+    } catch (e) {
+        console.warn('⚠️ Workflow error:', e);
     }
 }
 
@@ -337,7 +562,7 @@ async function checkDuplicate(url, authHeader) {
 }
 
 // ===========================================================================
-// UPLOAD: USER MODE
+// UPLOAD: USER MODE (aligned with API: repo_field filtering, fallback, collections)
 // ===========================================================================
 
 async function uploadAsUser(metadata, session) {
@@ -350,13 +575,16 @@ async function uploadAsUser(metadata, session) {
     const url = getSingleValue(metadata, 'ccm:wwwurl');
     if (!url) throw new Error('URL fehlt in Metadaten');
 
+    // 0. Fetch repo_field IDs from API schema (aligned with API get_repo_fields)
+    const repoFieldIds = await fetchRepoFieldIds(metadata);
+
     // 1. Duplicate check
     const existingNode = await checkDuplicate(url, authHeader);
     if (existingNode) {
         return { success: false, error: 'duplicate', message: 'URL bereits im Repository.', existingNode };
     }
 
-    // 2. Create node
+    // 2. Create node (5 essential fields only, aligned with API)
     const titleArray = ensureArray(getFieldValue(metadata, 'cclom:title'), ['Untitled']);
     const createPayload = {
         'ccm:wwwurl': ensureArray(url),
@@ -392,114 +620,88 @@ async function uploadAsUser(metadata, session) {
     // 3. Ensure aspects for special fields
     await ensureAspects(nodeId, metadata, authHeader);
 
-    // 4. Set additional metadata (with obeyMds=false)
-    const metadataToSet = buildAdditionalMetadata(metadata);
+    // 4. Set metadata with repo_field filtering + field-by-field fallback
+    const metadataToSet = buildAdditionalMetadata(metadata, repoFieldIds);
+    let metaResult = { fields_written: 0, fields_skipped: 0, field_errors: [] };
     if (Object.keys(metadataToSet).length > 0) {
-        const metaResponse = await fetch(
-            `${REPOSITORY_URL}/edu-sharing/rest/node/v1/nodes/-home-/${nodeId}/metadata?versionComment=METADATA_UPDATE&obeyMds=false`,
-            {
-                method: 'POST',
-                headers: { 'Authorization': authHeader, 'Content-Type': 'application/json', 'Accept': 'application/json' },
-                credentials: 'include',
-                body: JSON.stringify(metadataToSet)
-            }
-        );
-        if (!metaResponse.ok) console.warn('⚠️ Set metadata failed, but node was created');
-        else console.log('✅ Metadata set');
+        metaResult = await setMetadataWithFallback(nodeId, metadataToSet, authHeader);
     }
 
+    // 5. Set collections if present
+    const collectionIds = extractCollectionIds(metadata);
+    if (collectionIds.length > 0) {
+        await setCollections(nodeId, collectionIds, authHeader);
+    }
+
+    // 6. Start review workflow (aligned with API)
+    await startWorkflow(nodeId, authHeader);
+
     const repoUrl = `${REPOSITORY_URL}/edu-sharing/components/render/${nodeId}`;
-    return { success: true, nodeId, mode: 'user', title: titleArray[0], repoUrl, repositoryUrl: repoUrl };
+    return {
+        success: true, nodeId, mode: 'user', title: titleArray[0], repoUrl, repositoryUrl: repoUrl,
+        fields_written: metaResult.fields_written, fields_skipped: metaResult.fields_skipped
+    };
 }
 
 // ===========================================================================
-// UPLOAD: GUEST MODE
+// UPLOAD: GUEST MODE — Delegate to API /upload (ensures identical logic)
 // ===========================================================================
 
 async function uploadAsGuest(metadata) {
-    console.log('🔓 Uploading as Guest...');
-
-    const authHeader = 'Basic ' + btoa(GUEST_CREDENTIALS.username + ':' + GUEST_CREDENTIALS.password);
+    console.log('🔓 Uploading as Guest via API /upload...');
 
     const url = getSingleValue(metadata, 'ccm:wwwurl');
     if (!url) throw new Error('URL fehlt in Metadaten');
 
-    // 1. Duplicate check
-    const existingNode = await checkDuplicate(url, authHeader);
-    if (existingNode) {
-        return { success: false, error: 'duplicate', message: 'URL bereits im Repository.', existingNode };
+    // Delegate entire upload to API — ensures identical processing
+    // (repo_field filtering, transforms, field-by-field fallback, workflow)
+    const response = await fetch(`${API_URL}/upload`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify({
+            metadata: metadata,
+            repository: 'staging',
+            check_duplicates: true,
+            start_workflow: true
+        })
+    });
+
+    if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`API upload failed: ${response.status} - ${errorText.substring(0, 300)}`);
     }
 
-    // 2. Create node
-    const titleArray = ensureArray(getFieldValue(metadata, 'cclom:title'), ['Untitled']);
-    const essentialFields = {
-        'cclom:title': titleArray,
-        'cclom:general_description': ensureArray(getFieldValue(metadata, 'cclom:general_description')),
-        'cclom:general_keyword': ensureArray(getFieldValue(metadata, 'cclom:general_keyword')),
-        'ccm:wwwurl': ensureArray(url),
-        'cclom:general_language': ensureArray(getFieldValue(metadata, 'cclom:general_language'), ['de_DE'])
+    const result = await response.json();
+    console.log('📡 API /upload response:', result);
+
+    // Map API response to plugin format
+    if (result.duplicate) {
+        return {
+            success: false,
+            error: 'duplicate',
+            message: result.error || 'URL bereits im Repository.',
+            existingNode: result.node ? {
+                id: result.node.nodeId,
+                title: result.node.title,
+                url: result.node.wwwurl
+            } : null
+        };
+    }
+
+    if (!result.success) {
+        throw new Error(result.error || 'Upload fehlgeschlagen');
+    }
+
+    const nodeId = result.node?.nodeId;
+    const title = result.node?.title || getSingleValue(metadata, 'cclom:title') || 'Untitled';
+    const repoUrl = result.node?.repositoryUrl || (nodeId ? `${REPOSITORY_URL}/edu-sharing/components/render/${nodeId}` : null);
+
+    return {
+        success: true, nodeId, mode: 'guest', title, repoUrl, repositoryUrl: repoUrl,
+        message: 'Zur Prüfung eingereicht!',
+        fields_written: result.fields_written,
+        fields_skipped: result.fields_skipped
     };
-
-    const createResponse = await fetch(
-        `${REPOSITORY_URL}/edu-sharing/rest/node/v1/nodes/-home-/${GUEST_INBOX_ID}/children?type=ccm:io&renameIfExists=true&versionComment=MAIN_FILE_UPLOAD`,
-        {
-            method: 'POST',
-            headers: { 'Authorization': authHeader, 'Content-Type': 'application/json', 'Accept': 'application/json' },
-            credentials: 'include',
-            body: JSON.stringify(essentialFields)
-        }
-    );
-
-    if (!createResponse.ok) {
-        const errorText = await createResponse.text();
-        throw new Error(`Create node failed: ${createResponse.status} - ${errorText.substring(0, 200)}`);
-    }
-
-    const createData = await createResponse.json();
-    const nodeId = createData.node.ref.id;
-    console.log('✅ Node created:', nodeId);
-
-    // 3. Ensure aspects for special fields
-    await ensureAspects(nodeId, metadata, authHeader);
-
-    // 4. Set additional metadata (with obeyMds=false)
-    const metadataToSet = buildAdditionalMetadata(metadata);
-    if (Object.keys(metadataToSet).length > 0) {
-        const metaResponse = await fetch(
-            `${REPOSITORY_URL}/edu-sharing/rest/node/v1/nodes/-home-/${nodeId}/metadata?versionComment=METADATA_UPDATE&obeyMds=false`,
-            {
-                method: 'POST',
-                headers: { 'Authorization': authHeader, 'Content-Type': 'application/json', 'Accept': 'application/json' },
-                credentials: 'include',
-                body: JSON.stringify(metadataToSet)
-            }
-        );
-        if (!metaResponse.ok) console.warn('⚠️ Set metadata failed, but node was created');
-        else console.log('✅ Metadata set');
-    }
-
-    // 5. Start workflow
-    const workflowPayload = {
-        receiver: [{ authorityName: 'GROUP_ORG_WLO-Uploadmanager' }],
-        comment: 'Upload via Browser Extension (Guest)',
-        status: '200_tocheck'
-    };
-    try {
-        await fetch(
-            `${REPOSITORY_URL}/edu-sharing/rest/node/v1/nodes/-home-/${nodeId}/workflow`,
-            {
-                method: 'PUT',
-                headers: { 'Authorization': authHeader, 'Content-Type': 'application/json', 'Accept': 'application/json' },
-                credentials: 'include',
-                body: JSON.stringify(workflowPayload)
-            }
-        );
-        console.log('✅ Workflow started');
-    } catch (e) {
-        console.warn('⚠️ Workflow start failed:', e);
-    }
-
-    return { success: true, nodeId, mode: 'guest', title: titleArray[0], message: 'Zur Prüfung eingereicht!' };
 }
 
 // ===========================================================================
@@ -717,4 +919,4 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
 });
 
-console.log('✅ Background Service Worker v7 initialized');
+console.log('✅ Background Service Worker v8 initialized');
