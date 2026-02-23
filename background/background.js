@@ -1,5 +1,5 @@
 // WLO Metadaten-Agent - Background Service Worker
-// VERSION: 7.0.0 — Direct Web Component + FastAPI Backend
+// VERSION: 7.1.0 — VCARD author, obeyMds=false, geo extraction, aspects
 // Upload logic handles flat metadata format from FastAPI/web component
 console.log('🚀 WLO Background Service Worker v7 loaded');
 
@@ -143,7 +143,15 @@ function buildAdditionalMetadata(metadata) {
     }
 
     // Handle license transform
-    return applyLicenseTransform(result, metadata);
+    applyLicenseTransform(result, metadata);
+
+    // Transform cm:author → ccm:lifecyclecontributer_author (VCARD format)
+    transformAuthorToVcard(result);
+
+    // Extract geo coordinates from schema:location / schema:geo
+    extractGeoCoordinates(result, metadata);
+
+    return result;
 }
 
 function applyLicenseTransform(result, originalMetadata) {
@@ -168,6 +176,130 @@ function applyLicenseTransform(result, originalMetadata) {
     }
 
     return result;
+}
+
+// ===========================================================================
+// VCARD AUTHOR TRANSFORM
+// ===========================================================================
+
+function transformAuthorToVcard(result) {
+    const authors = result['cm:author'];
+    if (!authors || authors.length === 0) return;
+
+    const vcards = [];
+    for (const author of authors) {
+        const name = String(author).trim();
+        if (!name) continue;
+        const parts = name.split(' ');
+        let vcard;
+        if (parts.length >= 2) {
+            const last = parts[parts.length - 1];
+            const first = parts.slice(0, -1).join(' ');
+            vcard = `BEGIN:VCARD\nFN:${name}\nN:${last};${first}\nVERSION:3.0\nEND:VCARD`;
+        } else {
+            vcard = `BEGIN:VCARD\nFN:${name}\nN:${name}\nVERSION:3.0\nEND:VCARD`;
+        }
+        vcards.push(vcard);
+    }
+
+    if (vcards.length > 0) {
+        delete result['cm:author'];
+        result['ccm:lifecyclecontributer_author'] = vcards;
+        console.log(`👤 Author VCARD: ${vcards.length} entries`);
+    }
+}
+
+// ===========================================================================
+// GEO COORDINATE EXTRACTION
+// ===========================================================================
+
+function extractGeoCoordinates(result, metadata) {
+    // Source 1: schema:location[].geo.latitude/longitude
+    const locations = metadata['schema:location'];
+    if (Array.isArray(locations)) {
+        for (const loc of locations) {
+            if (loc && typeof loc === 'object' && loc.geo && typeof loc.geo === 'object') {
+                const lat = loc.geo.latitude;
+                const lon = loc.geo.longitude;
+                if (lat != null && lon != null) {
+                    result['cm:latitude'] = [String(lat)];
+                    result['cm:longitude'] = [String(lon)];
+                    console.log(`📍 Geo (location): ${lat}, ${lon}`);
+                    return;
+                }
+            }
+        }
+    }
+
+    // Source 2: schema:geo (organization top-level)
+    const geo = metadata['schema:geo'];
+    if (geo && typeof geo === 'object') {
+        const lat = geo.latitude;
+        const lon = geo.longitude;
+        if (lat != null && lon != null) {
+            result['cm:latitude'] = [String(lat)];
+            result['cm:longitude'] = [String(lon)];
+            console.log(`📍 Geo (top-level): ${lat}, ${lon}`);
+        }
+    }
+}
+
+// ===========================================================================
+// ENSURE ASPECTS
+// ===========================================================================
+
+async function ensureAspects(nodeId, metadata, authHeader) {
+    const extraAspects = [];
+
+    // cm:geographic for geo fields
+    let hasGeo = false;
+    const locations = metadata['schema:location'];
+    if (Array.isArray(locations)) {
+        hasGeo = locations.some(l => l && typeof l === 'object' && l.geo && typeof l.geo === 'object');
+    }
+    if (!hasGeo && metadata['schema:geo'] && typeof metadata['schema:geo'] === 'object') {
+        const g = metadata['schema:geo'];
+        if (g.latitude != null && g.longitude != null) hasGeo = true;
+    }
+    if (hasGeo) extraAspects.push('cm:geographic');
+
+    // cm:author for VCARD
+    if (metadata['cm:author'] && (Array.isArray(metadata['cm:author']) ? metadata['cm:author'].length > 0 : true)) {
+        extraAspects.push('cm:author');
+    }
+
+    if (extraAspects.length === 0) return;
+
+    try {
+        // Read current aspects
+        const metaResp = await fetch(
+            `${REPOSITORY_URL}/edu-sharing/rest/node/v1/nodes/-home-/${nodeId}/metadata?propertyFilter=-all-`,
+            { headers: { 'Authorization': authHeader, 'Accept': 'application/json' }, credentials: 'include' }
+        );
+        let currentAspects = [];
+        if (metaResp.ok) {
+            const data = await metaResp.json();
+            currentAspects = data.node?.aspects || [];
+        }
+
+        const newAspects = extraAspects.filter(a => !currentAspects.includes(a));
+        if (newAspects.length === 0) return;
+
+        const fullList = [...currentAspects, ...newAspects];
+        const resp = await fetch(
+            `${REPOSITORY_URL}/edu-sharing/rest/node/v1/nodes/-home-/${nodeId}/aspects`,
+            {
+                method: 'PUT',
+                headers: { 'Authorization': authHeader, 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                credentials: 'include',
+                body: JSON.stringify(fullList)
+            }
+        );
+        if (resp.ok) console.log(`🔧 Aspects added: ${newAspects.join(', ')}`);
+        else console.warn(`⚠️ Aspects failed: ${resp.status}`);
+    } catch (e) {
+        console.warn('⚠️ Aspect update error:', e);
+    }
 }
 
 // ===========================================================================
@@ -257,11 +389,14 @@ async function uploadAsUser(metadata, session) {
     const nodeId = createData.node.ref.id;
     console.log('✅ Node created:', nodeId);
 
-    // 3. Set additional metadata
+    // 3. Ensure aspects for special fields
+    await ensureAspects(nodeId, metadata, authHeader);
+
+    // 4. Set additional metadata (with obeyMds=false)
     const metadataToSet = buildAdditionalMetadata(metadata);
     if (Object.keys(metadataToSet).length > 0) {
         const metaResponse = await fetch(
-            `${REPOSITORY_URL}/edu-sharing/rest/node/v1/nodes/-home-/${nodeId}/metadata?versionComment=METADATA_UPDATE`,
+            `${REPOSITORY_URL}/edu-sharing/rest/node/v1/nodes/-home-/${nodeId}/metadata?versionComment=METADATA_UPDATE&obeyMds=false`,
             {
                 method: 'POST',
                 headers: { 'Authorization': authHeader, 'Content-Type': 'application/json', 'Accept': 'application/json' },
@@ -324,11 +459,14 @@ async function uploadAsGuest(metadata) {
     const nodeId = createData.node.ref.id;
     console.log('✅ Node created:', nodeId);
 
-    // 3. Set additional metadata
+    // 3. Ensure aspects for special fields
+    await ensureAspects(nodeId, metadata, authHeader);
+
+    // 4. Set additional metadata (with obeyMds=false)
     const metadataToSet = buildAdditionalMetadata(metadata);
     if (Object.keys(metadataToSet).length > 0) {
         const metaResponse = await fetch(
-            `${REPOSITORY_URL}/edu-sharing/rest/node/v1/nodes/-home-/${nodeId}/metadata?versionComment=METADATA_UPDATE`,
+            `${REPOSITORY_URL}/edu-sharing/rest/node/v1/nodes/-home-/${nodeId}/metadata?versionComment=METADATA_UPDATE&obeyMds=false`,
             {
                 method: 'POST',
                 headers: { 'Authorization': authHeader, 'Content-Type': 'application/json', 'Accept': 'application/json' },
@@ -340,7 +478,7 @@ async function uploadAsGuest(metadata) {
         else console.log('✅ Metadata set');
     }
 
-    // 4. Start workflow
+    // 5. Start workflow
     const workflowPayload = {
         receiver: [{ authorityName: 'GROUP_ORG_WLO-Uploadmanager' }],
         comment: 'Upload via Browser Extension (Guest)',

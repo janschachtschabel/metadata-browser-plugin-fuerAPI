@@ -1,6 +1,6 @@
 # WLO Metadaten-Agent — Browser Plugin
 
-**Version:** 7.0.0  
+**Version:** 7.1.0  
 **Browser:** Chrome, Edge (Manifest V3)  
 **Kein iframe** — die Angular-Webkomponente läuft direkt in der Sidebar
 
@@ -101,7 +101,7 @@ metadata-browser-plugin-fuerAPI/
 ├── build-extension.ps1           # Build-Script: Webkomponente bauen + kopieren
 │
 ├── background/
-│   └── background.js             # Service Worker: Auth, Upload, Queue, History
+│   └── background.js             # Service Worker: Auth, Upload (VCARD, Geo, Aspects), Queue, History
 │
 ├── sidebar/
 │   ├── sidebar.html              # Sidebar UI mit <metadata-agent-canvas>
@@ -123,7 +123,7 @@ metadata-browser-plugin-fuerAPI/
 │   └── options.css
 │
 ├── webcomponent/                 # Angular Build (outputHashing: none)
-│   ├── main.js                   # ~1 MB — Angular App als Web Component
+│   ├── main.js                   # ~1.4 MB — Angular App als Web Component
 │   ├── polyfills.js
 │   ├── runtime.js
 │   ├── styles.css
@@ -182,15 +182,32 @@ const WLO_CONFIG = {
 ### Upload
 
 ```
-1. User klickt „Upload" in der Webkomponente
+1. User klickt „Upload“ in der Webkomponente
 2. <metadata-agent-canvas> feuert 'metadataSubmit' Event
 3. sidebar.js → chrome.runtime.sendMessage({action: 'saveMetadata'})
 4. background.js prüft Login-Status:
    → User-Modus: Node im User-Home erstellen
    → Gast-Modus: Node in Gast-Inbox + Workflow starten
 5. Duplikat-Check (ccm:wwwurl) vor Upload
-6. Ergebnis → Success/Duplicate Modal + History-Eintrag
+6. Node erstellen (POST .../children)
+7. Aspects setzen (cm:geographic, cm:author falls nötig)
+8. Metadaten schreiben (POST .../metadata?obeyMds=false)
+   → VCARD-Transformation: cm:author → ccm:lifecyclecontributer_author
+   → Geo-Extraktion: schema:location[].geo → cm:latitude/cm:longitude
+   → Lizenz-Transformation: ccm:custom_license → ccm:commonlicense_key
+9. Workflow starten (nur Gast-Modus)
+10. Ergebnis → Success/Duplicate Modal + History-Eintrag
 ```
+
+### Upload-Transformationen (background.js)
+
+| Funktion | Beschreibung |
+|----------|-------------|
+| `transformAuthorToVcard()` | `cm:author` → VCARD-Format in `ccm:lifecyclecontributer_author` |
+| `extractGeoCoordinates()` | `schema:location[].geo` oder `schema:geo` → `cm:latitude`/`cm:longitude` |
+| `ensureAspects()` | `cm:geographic` + `cm:author` Aspects nach Node-Erstellung setzen |
+| `applyLicenseTransform()` | Lizenz-URI → `ccm:commonlicense_key` + `ccm:commonlicense_cc_version` |
+| `buildAdditionalMetadata()` | Alle Felder normalisieren, Transformationen anwenden, `obeyMds=false` |
 
 ### Warenkorb — WLO-Overlay
 
@@ -272,6 +289,8 @@ Injiziert 🛒-Buttons auf jeder Suchergebnis-Kachel. Beim Klick wird das Item a
 
 ## Webkomponente aktualisieren
 
+### Option 1: Build-Script
+
 ```powershell
 # Im Plugin-Ordner:
 .\build-extension.ps1
@@ -282,7 +301,28 @@ Das Script:
 2. Kopiert `main.js`, `polyfills.js`, `runtime.js`, `styles.css` nach `webcomponent/`
 3. Kopiert i18n-Assets nach `webcomponent/assets/i18n/`
 
-Alternativ manuell die Dateien aus `metadata-agent-api/src/static/widget/dist/` kopieren.
+### Option 2: Manuell aus Web-Component-Projekt
+
+```powershell
+# Im metadata-agent-fuerAPI Ordner:
+npx ng build --configuration extension
+
+# Dateien kopieren:
+copy dist-extension\main.js      ..\metadata-browser-plugin-fuerAPI\webcomponent\
+copy dist-extension\polyfills.js  ..\metadata-browser-plugin-fuerAPI\webcomponent\
+copy dist-extension\runtime.js    ..\metadata-browser-plugin-fuerAPI\webcomponent\
+copy dist-extension\styles.css    ..\metadata-browser-plugin-fuerAPI\webcomponent\
+copy dist-extension\assets\i18n\* ..\metadata-browser-plugin-fuerAPI\webcomponent\assets\i18n\
+```
+
+### Option 3: Aus API-Widget-Verzeichnis
+
+Falls die API bereits aktuelle Dateien hat:
+
+```powershell
+copy ..\metadata-agent-api\src\static\widget\dist\*      webcomponent\
+copy ..\metadata-agent-api\src\static\widget\assets\i18n\* webcomponent\assets\i18n\
+```
 
 Danach in `chrome://extensions/` → **Aktualisieren** klicken.
 
