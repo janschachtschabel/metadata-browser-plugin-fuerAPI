@@ -195,8 +195,11 @@ const WLO_CONFIG = {
    → VCARD-Transformation: cm:author → ccm:lifecyclecontributer_author
    → Geo-Extraktion: schema:location[].geo → cm:latitude/cm:longitude
    → Lizenz-Transformation: ccm:custom_license → ccm:commonlicense_key
-9. Workflow starten (nur Gast-Modus)
-10. Ergebnis → Success/Duplicate Modal + History-Eintrag
+9. Extended Fields schreiben (ccm:oeh_extendedType/Data/Text)
+   → User-Modus: background.js schreibt direkt (writeExtendedFields)
+   → Gast-Modus: API /upload schreibt (write_extended_data=true)
+10. Workflow starten (nur Gast-Modus)
+11. Ergebnis → Success/Duplicate Modal + History-Eintrag
 ```
 
 ### Upload-Transformationen (background.js)
@@ -207,6 +210,7 @@ const WLO_CONFIG = {
 | `extractGeoCoordinates()` | `schema:location[].geo` oder `schema:geo` → `cm:latitude`/`cm:longitude` |
 | `ensureAspects()` | `cm:geographic` + `cm:author` Aspects nach Node-Erstellung setzen |
 | `applyLicenseTransform()` | Lizenz-URI → `ccm:commonlicense_key` + `ccm:commonlicense_cc_version` |
+| `writeExtendedFields()` | `ccm:oeh_extendedType` (Inhaltstyp-URI), `ccm:oeh_extendedData` (Metadaten-JSON), `ccm:oeh_extendedText` (Rohtext) |
 | `buildAdditionalMetadata()` | Alle Felder normalisieren, Transformationen anwenden, `obeyMds=false` |
 
 ### Warenkorb — WLO-Overlay

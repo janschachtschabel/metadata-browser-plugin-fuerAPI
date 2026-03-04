@@ -470,6 +470,81 @@ async function startWorkflow(nodeId, authHeader) {
 }
 
 // ===========================================================================
+// WRITE EXTENDED FIELDS (ccm:oeh_extendedType, ccm:oeh_extendedData, ccm:oeh_extendedText)
+// ===========================================================================
+
+async function writeExtendedFields(nodeId, metadata, authHeader) {
+    try {
+        const extendedFields = {};
+
+        // 1. ccm:oeh_extendedType — resolve URI from metadataset_uri (set by web component export)
+        const typeUri = metadata?.metadataset_uri;
+        if (typeUri) {
+            extendedFields['ccm:oeh_extendedType'] = [typeUri];
+        }
+
+        // 2. ccm:oeh_extendedData — full metadata as JSON string
+        const excludedKeys = new Set(['contextName', 'schemaVersion', 'metadataset', 'metadataset_uri', 'language', 'exportedAt', 'processing', '_origins', '_source_text', 'preview_image_url']);
+        const dataDict = {};
+        for (const [k, v] of Object.entries(metadata)) {
+            if (!excludedKeys.has(k) && v !== null && v !== undefined && v !== '') {
+                dataDict[k] = v;
+            }
+        }
+        if (Object.keys(dataDict).length > 0) {
+            extendedFields['ccm:oeh_extendedData'] = [JSON.stringify(dataDict)];
+        }
+
+        // 3. ccm:oeh_extendedText — raw source text before extraction
+        const sourceText = metadata?._source_text;
+        if (sourceText) {
+            extendedFields['ccm:oeh_extendedText'] = [sourceText];
+        }
+
+        if (Object.keys(extendedFields).length === 0) {
+            console.log('⚠️ No extended fields to write');
+            return;
+        }
+
+        const resp = await fetch(
+            `${REPOSITORY_URL}/edu-sharing/rest/node/v1/nodes/-home-/${nodeId}/metadata?versionComment=EXTENDED_DATA&obeyMds=false`,
+            {
+                method: 'POST',
+                headers: { 'Authorization': authHeader, 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                credentials: 'include',
+                body: JSON.stringify(extendedFields)
+            }
+        );
+
+        if (resp.ok || resp.status === 200 || resp.status === 201) {
+            console.log(`✅ Extended fields written: ${Object.keys(extendedFields).join(', ')}`);
+        } else {
+            console.warn(`⚠️ Extended fields write failed: ${resp.status}`);
+            // Fallback: write field-by-field
+            for (const [fieldId, fieldValue] of Object.entries(extendedFields)) {
+                try {
+                    const singleResp = await fetch(
+                        `${REPOSITORY_URL}/edu-sharing/rest/node/v1/nodes/-home-/${nodeId}/metadata?versionComment=EXTENDED_DATA&obeyMds=false`,
+                        {
+                            method: 'POST',
+                            headers: { 'Authorization': authHeader, 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                            credentials: 'include',
+                            body: JSON.stringify({ [fieldId]: fieldValue })
+                        }
+                    );
+                    if (singleResp.ok) console.log(`   ✅ ${fieldId}`);
+                    else console.warn(`   ❌ ${fieldId}: ${singleResp.status}`);
+                } catch (e) {
+                    console.warn(`   ❌ ${fieldId}: ${e.message}`);
+                }
+            }
+        }
+    } catch (e) {
+        console.warn('⚠️ Extended fields error:', e);
+    }
+}
+
+// ===========================================================================
 // ENSURE ASPECTS
 // ===========================================================================
 
@@ -633,7 +708,10 @@ async function uploadAsUser(metadata, session) {
         await setCollections(nodeId, collectionIds, authHeader);
     }
 
-    // 6. Start review workflow (aligned with API)
+    // 6. Write extended data fields (ccm:oeh_extendedType, ccm:oeh_extendedData, ccm:oeh_extendedText)
+    await writeExtendedFields(nodeId, metadata, authHeader);
+
+    // 7. Start review workflow (aligned with API)
     await startWorkflow(nodeId, authHeader);
 
     const repoUrl = `${REPOSITORY_URL}/edu-sharing/components/render/${nodeId}`;
@@ -647,23 +725,37 @@ async function uploadAsUser(metadata, session) {
 // UPLOAD: GUEST MODE — Delegate to API /upload (ensures identical logic)
 // ===========================================================================
 
-async function uploadAsGuest(metadata) {
+async function uploadAsGuest(metadata, previewUrl) {
     console.log('🔓 Uploading as Guest via API /upload...');
 
     const url = getSingleValue(metadata, 'ccm:wwwurl');
     if (!url) throw new Error('URL fehlt in Metadaten');
 
+    // Extract _source_text from metadata (added by web component export) for extended data
+    const sourceText = metadata?._source_text || undefined;
+
     // Delegate entire upload to API — ensures identical processing
     // (repo_field filtering, transforms, field-by-field fallback, workflow)
+    const uploadBody = {
+        metadata: metadata,
+        repository: 'staging',
+        check_duplicates: true,
+        start_workflow: true,
+        write_extended_data: true,
+        extended_text: sourceText
+    };
+
+    // Pass preview URL for server-side screenshot capture (guest has no direct repo access)
+    if (previewUrl) {
+        uploadBody.preview_url = previewUrl;
+        uploadBody.screenshot_method = 'pageshot';
+        console.log('📸 Guest mode: passing preview_url to API for screenshot:', previewUrl);
+    }
+
     const response = await fetch(`${API_URL}/upload`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-        body: JSON.stringify({
-            metadata: metadata,
-            repository: 'staging',
-            check_duplicates: true,
-            start_workflow: true
-        })
+        body: JSON.stringify(uploadBody)
     });
 
     if (!response.ok) {
@@ -708,7 +800,7 @@ async function uploadAsGuest(metadata) {
 // SAVE HANDLER
 // ===========================================================================
 
-async function handleSaveMetadata(metadata) {
+async function handleSaveMetadata(metadata, previewUrl) {
     console.log('💾 Starting metadata save...');
     try {
         const { wloSession } = await chrome.storage.local.get('wloSession');
@@ -716,10 +808,57 @@ async function handleSaveMetadata(metadata) {
         console.log(`📋 Mode: ${isUserMode ? 'User' : 'Guest'}`);
 
         if (isUserMode) return await uploadAsUser(metadata, wloSession);
-        else return await uploadAsGuest(metadata);
+        else return await uploadAsGuest(metadata, previewUrl);
     } catch (error) {
         console.error('❌ Save failed:', error);
         throw error;
+    }
+}
+
+// ===========================================================================
+// SCREENSHOT: Capture visible tab & upload as preview
+// ===========================================================================
+
+async function captureVisibleTab() {
+    try {
+        const dataUrl = await chrome.tabs.captureVisibleTab(null, { format: 'png', quality: 90 });
+        console.log('📸 Tab screenshot captured:', Math.round(dataUrl.length / 1024), 'KB');
+        return dataUrl;
+    } catch (e) {
+        console.warn('⚠️ captureVisibleTab failed:', e);
+        return null;
+    }
+}
+
+async function uploadPreviewImage(nodeId, dataUrl, authHeader) {
+    if (!nodeId || !dataUrl) return false;
+    try {
+        // Convert data URL to Blob
+        const resp = await fetch(dataUrl);
+        const blob = await resp.blob();
+
+        const uploadUrl = `${REPOSITORY_URL}/edu-sharing/rest/node/v1/nodes/-home-/${nodeId}/preview?mimetype=image/png&createVersion=true`;
+
+        const formData = new FormData();
+        formData.append('image', blob, 'screenshot.png');
+
+        const uploadResp = await fetch(uploadUrl, {
+            method: 'POST',
+            headers: { 'Authorization': authHeader },
+            credentials: 'include',
+            body: formData
+        });
+
+        if (uploadResp.ok || uploadResp.status === 200 || uploadResp.status === 204) {
+            console.log('✅ Preview image uploaded to node', nodeId);
+            return true;
+        } else {
+            console.warn('⚠️ Preview upload failed:', uploadResp.status);
+            return false;
+        }
+    } catch (e) {
+        console.warn('⚠️ Preview upload error:', e);
+        return false;
     }
 }
 
@@ -748,7 +887,7 @@ async function getActiveNormalTab() {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // Save metadata (async)
     if (message.action === 'saveMetadata') {
-        handleSaveMetadata(message.metadata)
+        handleSaveMetadata(message.metadata, message.previewUrl)
             .then(result => sendResponse(result))
             .catch(error => sendResponse({ success: false, error: error.message }));
         return true;
@@ -815,6 +954,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                     } catch (e) {
                         return { success: false, error: e?.message || 'EXTRACTION_FAILED' };
                     }
+                }
+
+                case 'tabs.captureScreenshot': {
+                    const dataUrl = await captureVisibleTab();
+                    return dataUrl ? { success: true, dataUrl } : { success: false, error: 'CAPTURE_FAILED' };
+                }
+
+                case 'tabs.uploadPreview': {
+                    const { nodeId, screenshotDataUrl, authHeader } = message;
+                    const ok = await uploadPreviewImage(nodeId, screenshotDataUrl, authHeader);
+                    return { success: ok };
                 }
 
                 // Queue operations
