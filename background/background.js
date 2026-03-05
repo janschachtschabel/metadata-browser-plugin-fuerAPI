@@ -227,6 +227,12 @@ function applyLicenseTransform(result, originalMetadata) {
         }
     }
 
+    // Default license: COPYRIGHT_FREE if no license was set
+    if (!result['ccm:commonlicense_key']) {
+        result['ccm:commonlicense_key'] = ['COPYRIGHT_FREE'];
+        console.log('📜 Default license: COPYRIGHT_FREE (no license detected)');
+    }
+
     return result;
 }
 
@@ -470,6 +476,19 @@ async function startWorkflow(nodeId, authHeader) {
 }
 
 // ===========================================================================
+// EXTENDED TYPE → NEW_LRT MAPPING
+// ===========================================================================
+
+const EXTENDED_TYPE_TO_NEW_LRT = {
+    'http://w3id.org/openeduhub/vocabs/contentTypes/event': 'http://w3id.org/openeduhub/vocabs/new_lrt/955590ae-5f06-4513-98e9-91dfa8d5a05e',
+    'http://w3id.org/openeduhub/vocabs/contentTypes/source': 'http://w3id.org/openeduhub/vocabs/new_lrt/3869b453-d3c1-4b34-8f25-9127e9d68766',
+    'http://w3id.org/openeduhub/vocabs/contentTypes/education_offer': 'http://w3id.org/openeduhub/vocabs/new_lrt/03ab835b-c39c-48d1-b5af-7611de2f6464',
+    'http://w3id.org/openeduhub/vocabs/contentTypes/tool_service': 'http://w3id.org/openeduhub/vocabs/new_lrt/cefccf75-cba3-427d-9a0f-35b4fedcbba1',
+    'http://w3id.org/openeduhub/vocabs/contentTypes/didactic_concepts': 'http://w3id.org/openeduhub/vocabs/new_lrt/0a79a1d0-583b-47ce-86a7-517ab352d796',
+    'http://w3id.org/openeduhub/vocabs/contentTypes/learning_material': 'http://w3id.org/openeduhub/vocabs/new_lrt/1846d876-d8fd-476a-b540-b8ffd713fedb',
+};
+
+// ===========================================================================
 // WRITE EXTENDED FIELDS (ccm:oeh_extendedType, ccm:oeh_extendedData, ccm:oeh_extendedText)
 // ===========================================================================
 
@@ -481,6 +500,13 @@ async function writeExtendedFields(nodeId, metadata, authHeader) {
         const typeUri = metadata?.metadataset_uri;
         if (typeUri) {
             extendedFields['ccm:oeh_extendedType'] = [typeUri];
+        }
+
+        // 1b. oeh:new_lrt — map extended type to learning resource type
+        if (typeUri && EXTENDED_TYPE_TO_NEW_LRT[typeUri]) {
+            const lrtUri = EXTENDED_TYPE_TO_NEW_LRT[typeUri];
+            extendedFields['oeh:new_lrt'] = [lrtUri];
+            console.log(`📎 new_lrt: ${lrtUri} (from extendedType ${typeUri.split('/').pop()})`);
         }
 
         // 2. ccm:oeh_extendedData — full metadata as JSON string
