@@ -26,8 +26,7 @@ const WLO_CONFIG = {
     webcomponent: {
         layout: 'plugin',
         theme: 'edu-sharing',
-        highlightAi: false,
-        language: 'de'
+        highlightAi: false
     },
 
     getApiUrl() {

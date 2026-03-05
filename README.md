@@ -1,6 +1,6 @@
 # WLO Metadaten-Agent — Browser Plugin
 
-**Version:** 7.1.0  
+**Version:** 7.0.0  
 **Browser:** Chrome, Edge (Manifest V3)  
 **Kein iframe** — die Angular-Webkomponente läuft direkt in der Sidebar
 
@@ -155,8 +155,8 @@ const WLO_CONFIG = {
     },
     webcomponent: {
         layout: 'plugin',
-        highlightAi: false,
-        language: 'de'
+        theme: 'edu-sharing',
+        highlightAi: false
     }
 };
 ```
@@ -182,24 +182,26 @@ const WLO_CONFIG = {
 ### Upload
 
 ```
-1. User klickt „Upload“ in der Webkomponente
+1. User klickt „Upload" in der Webkomponente
 2. <metadata-agent-canvas> feuert 'metadataSubmit' Event
-3. sidebar.js → chrome.runtime.sendMessage({action: 'saveMetadata'})
-4. background.js prüft Login-Status:
+3. sidebar.js bewahrt Header-Felder (metadataset_uri, _source_text, _origins etc.)
+   beim Unwrapping der verschachtelten Metadaten → nötig für Extended Data
+4. sidebar.js → chrome.runtime.sendMessage({action: 'saveMetadata'})
+5. background.js prüft Login-Status:
    → User-Modus: Node im User-Home erstellen
    → Gast-Modus: Node in Gast-Inbox + Workflow starten
-5. Duplikat-Check (ccm:wwwurl) vor Upload
-6. Node erstellen (POST .../children)
-7. Aspects setzen (cm:geographic, cm:author falls nötig)
-8. Metadaten schreiben (POST .../metadata?obeyMds=false)
+6. Duplikat-Check (ccm:wwwurl) vor Upload
+7. Node erstellen (POST .../children)
+8. Aspects setzen (cm:geographic, cm:author falls nötig)
+9. Metadaten schreiben (POST .../metadata?obeyMds=false)
    → VCARD-Transformation: cm:author → ccm:lifecyclecontributer_author
    → Geo-Extraktion: schema:location[].geo → cm:latitude/cm:longitude
    → Lizenz-Transformation: ccm:custom_license → ccm:commonlicense_key
-9. Extended Fields schreiben (ccm:oeh_extendedType/Data/Text)
-   → User-Modus: background.js schreibt direkt (writeExtendedFields)
-   → Gast-Modus: API /upload schreibt (write_extended_data=true)
-10. Workflow starten (nur Gast-Modus)
-11. Ergebnis → Success/Duplicate Modal + History-Eintrag
+10. Extended Fields schreiben (ccm:oeh_extendedType/Data/Text)
+    → User-Modus: background.js schreibt direkt (writeExtendedFields)
+    → Gast-Modus: API /upload schreibt (write_extended_data=true)
+11. Workflow starten (nur Gast-Modus)
+12. Ergebnis → Success/Duplicate Modal + History-Eintrag
 ```
 
 ### Upload-Transformationen (background.js)

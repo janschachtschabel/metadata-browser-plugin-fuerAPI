@@ -106,7 +106,6 @@ function feedDataToCanvas(text, url) {
     metadataCanvas.apiUrl = API_URL;
     metadataCanvas.layout = 'plugin';
     metadataCanvas.highlightAi = false;
-    metadataCanvas.language = 'de';
 
     // Pass captured screenshot as preview image to the web component
     if (screenshotDataUrl) {
@@ -426,12 +425,20 @@ function closeCanvas() {
 async function handleCanvasSaveMetadata(rawMetadata) {
     console.log('💾 Saving metadata from web component...', rawMetadata);
 
-    // The web component emits: { contextName, schemaVersion, metadataset, metadata: {...}, _origins }
+    // The web component emits: { contextName, schemaVersion, metadataset, metadataset_uri, metadata: {...}, _origins, _source_text }
     // The plugin upload expects flat keys like cclom:title at the top level.
-    // Unwrap if the actual field values are nested inside a 'metadata' property.
+    // Unwrap if the actual field values are nested inside a 'metadata' property,
+    // but preserve header fields needed for extended data (metadataset_uri, _source_text, etc.)
     let metadata = rawMetadata;
     if (rawMetadata && rawMetadata.metadata && typeof rawMetadata.metadata === 'object') {
-        metadata = rawMetadata.metadata;
+        metadata = { ...rawMetadata.metadata };
+        // Preserve header fields needed for extended data and schema resolution
+        const headerFields = ['contextName', 'schemaVersion', 'metadataset', 'metadataset_uri', '_origins', '_source_text'];
+        for (const key of headerFields) {
+            if (rawMetadata[key] !== undefined) {
+                metadata[key] = rawMetadata[key];
+            }
+        }
         // Preserve the source URL from the current item if not in metadata
         if (!metadata['ccm:wwwurl'] && currentCanvasItem?.url) {
             metadata['ccm:wwwurl'] = currentCanvasItem.url;
