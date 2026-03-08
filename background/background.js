@@ -502,10 +502,10 @@ async function writeExtendedFields(nodeId, metadata, authHeader) {
             extendedFields['ccm:oeh_extendedType'] = [typeUri];
         }
 
-        // 1b. oeh:new_lrt — map extended type to learning resource type
+        // 1b. ccm:oeh_lrt — map extended type to learning resource type
         if (typeUri && EXTENDED_TYPE_TO_NEW_LRT[typeUri]) {
             const lrtUri = EXTENDED_TYPE_TO_NEW_LRT[typeUri];
-            extendedFields['oeh:new_lrt'] = [lrtUri];
+            extendedFields['ccm:oeh_lrt'] = [lrtUri];
             console.log(`📎 new_lrt: ${lrtUri} (from extendedType ${typeUri.split('/').pop()})`);
         }
 
