@@ -1,0 +1,36 @@
+{
+  "contextName": "default",
+  "schemaVersion": "1.8.1",
+  "metadataset": "event.json",
+  "language": "de",
+  "metadata": {
+    "cclom:title": "Termine_WP-Physik",
+    "cclom:general_description": "Der MNU - Verband zur Förderung des MINT Unterrichts tritt seit 1891 für Qualität und Fortschritt in den mathematischen und naturwissenschaftlichen Schulfächern ein.",
+    "cclom:general_keyword": ["Wettbewerb"],
+    "ccm:wwwurl": "https://www.mnu.de/veranstaltungen",
+    "ccm:oeh_extendedType": ["http://w3id.org/openeduhub/vocabs/new_lrt_aggregated/event"],
+    "ccm:taxonid": [
+      "http://w3id.org/openeduhub/vocabs/discipline/520"
+    ],
+    "ccm:educationalcontext": [
+      "http://w3id.org/openeduhub/vocabs/educationalContext/sekundarstufe_1"
+    ],
+    "ccm:educationalintendedenduserrole": [
+      "http://w3id.org/openeduhub/vocabs/intendedEndUserRole/learner",
+      "http://w3id.org/openeduhub/vocabs/intendedEndUserRole/teacher"
+    ],
+    "ccm:oeh_publisher_combined": [
+      "Deutscher Verein zur Förderung des mathematischen und naturwissenschaftlichen Unterrichts (MNU)"
+    ],
+    "ccm:commonlicense_key": "COPYRIGHT_FREE",
+    "ccm:custom_license": "Copyright, freier Zugang. Das Werk ist kostenfrei zugänglich. Nutzung und Quellenangabe gemäß den allgemeingültigen gesetzlichen Regelungen (UrhG).",
+    "oeh:eventType": ["Event, Wettbewerb"],
+    "ccm:oeh_event_begin": "",
+    "ccm:oeh_event_end": "",
+    "ccm:oeh_event_location": "Deutschland",
+    "ccm:oeh_event_host": "MNU - Verband zur Förderung des MINT Unterrichts",
+    "ccm:oeh_event_costs": "kostenfrei",
+    "ccm:oeh_event_target_group": "Lehrkräfte, Schüler/innen",
+    "ccm:oeh_event_registration": "https://www.mnu.de/veranstaltungen"
+  }
+}
