@@ -2,8 +2,25 @@
 // VERSION: 7.0.0 — Direct Web Component Integration (no iframe)
 console.log('🎨 Sidebar v7 loaded (direct web component)');
 
-const REPOSITORY_URL = WLO_CONFIG.getRepositoryUrl();
-const API_URL = WLO_CONFIG.getApiUrl();
+let REPOSITORY_URL = WLO_CONFIG.getRepositoryUrl();
+let API_URL = WLO_CONFIG.getApiUrl();
+
+// Custom URLs aus Options-Seite laden (überschreibt Config-Defaults)
+async function loadCustomUrls() {
+    try {
+        const { customApiUrl, customRepositoryUrl } = await chrome.storage.local.get(['customApiUrl', 'customRepositoryUrl']);
+        if (customApiUrl) {
+            API_URL = customApiUrl;
+            window.__ENV = { agentUrl: customApiUrl };
+            console.log('🔧 Custom API URL from options:', customApiUrl);
+        }
+        if (customRepositoryUrl) {
+            REPOSITORY_URL = customRepositoryUrl;
+            console.log('🔧 Custom Repository URL from options:', customRepositoryUrl);
+        }
+    } catch (e) { /* storage not available */ }
+}
+loadCustomUrls();
 
 // ============================================================================
 // DOM ELEMENTS

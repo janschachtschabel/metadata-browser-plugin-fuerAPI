@@ -309,7 +309,6 @@
                     <metadata-agent-canvas
                         id="metadata-canvas"
                         layout="plugin"
-                        api-url="https://metadata-agent-api.vercel.app"
                         highlight-ai="false"
                         language="de"
                         show-status-bar="false"
@@ -328,13 +327,18 @@
         </div>
     </div>
 
+    <!-- Config zuerst laden (enthält API-URL etc.) -->
+    <script src="../config.js"></script>
+
+    <!-- API-URL aus Config setzen BEVOR Angular bootet -->
+    <script>window.__ENV = { agentUrl: WLO_CONFIG.api.url };</script>
+
     <!-- Web Component Scripts (Angular Elements — no iframe needed) -->
     <script src="../webcomponent/runtime.js"></script>
     <script src="../webcomponent/polyfills.js"></script>
     <script src="../webcomponent/main.js"></script>
 
     <!-- Plugin Scripts -->
-    <script src="../config.js"></script>
     <script src="warenkorb-patterns.js"></script>
     <script src="warenkorb-api.js"></script>
     <script src="warenkorb.js"></script>

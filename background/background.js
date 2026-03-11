@@ -4,14 +4,25 @@
 console.log('🚀 WLO Background Service Worker v8 loaded');
 
 // ===========================================================================
-// CONFIGURATION
+// CONFIGURATION (aus zentraler config.js)
 // ===========================================================================
 
-const API_URL = 'https://metadata-agent-api.vercel.app';
-const REPOSITORY_URL = 'https://repository.staging.openeduhub.net';
+importScripts('../config.js');
+
+let API_URL = WLO_CONFIG.getApiUrl();
+let REPOSITORY_URL = WLO_CONFIG.getRepositoryUrl();
 
 const MAX_QUEUE_SIZE = 100;
 const MAX_HISTORY_SIZE = 100;
+
+// Custom URLs aus Options-Seite laden (überschreibt Config-Defaults)
+(async () => {
+    try {
+        const { customApiUrl, customRepositoryUrl } = await chrome.storage.local.get(['customApiUrl', 'customRepositoryUrl']);
+        if (customApiUrl) { API_URL = customApiUrl; console.log('🔧 Custom API URL:', customApiUrl); }
+        if (customRepositoryUrl) { REPOSITORY_URL = customRepositoryUrl; console.log('🔧 Custom Repository URL:', customRepositoryUrl); }
+    } catch (e) { /* storage not available */ }
+})();
 
 // ===========================================================================
 // SIDEBAR MANAGEMENT

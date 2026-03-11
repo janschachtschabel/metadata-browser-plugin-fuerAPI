@@ -102,9 +102,10 @@ metadata-browser-plugin-fuerAPI/
 │
 ├── background/
 │   └── background.js             # Service Worker: Auth, Upload (VCARD, Geo, Aspects), Queue, History
+│                                # Lädt config.js via importScripts() (keine hardcoded URLs)
 │
 ├── sidebar/
-│   ├── sidebar.html              # Sidebar UI mit <metadata-agent-canvas>
+│   ├── sidebar.html              # Sidebar UI: config.js → window.__ENV → Widget-Scripts
 │   ├── sidebar.js                # Event-Bridge: Web Component ↔ Plugin
 │   ├── sidebar.css               # Material Design v3 Styles
 │   ├── warenkorb.js              # Warenkorb-Controller (Phasen, Drag & Drop, Export)
@@ -137,12 +138,12 @@ metadata-browser-plugin-fuerAPI/
 
 ## Konfiguration
 
-Zentral in `config.js`:
+Zentral in `config.js` — **einzige Stelle** zum Ändern der API-URL:
 
 ```javascript
 const WLO_CONFIG = {
     api: {
-        url: 'https://metadata-agent-api.vercel.app',
+        url: 'https://metadata-agent-api.vercel.app',  // ← hier ändern
         localUrl: 'http://localhost:8000'
     },
     repository: {
@@ -161,7 +162,26 @@ const WLO_CONFIG = {
 };
 ```
 
-Überschreibbar via **Einstellungen** (Options-Seite) oder `chrome.storage.local`.
+### URL-Fluss
+
+Die API-URL fließt aus `config.js` in alle Komponenten:
+
+```
+config.js (WLO_CONFIG.api.url)
+  │
+  ├── sidebar.html:   window.__ENV = { agentUrl: WLO_CONFIG.api.url }
+  │                  → Angular bootet mit korrekter URL (i18n, Schema)
+  │
+  ├── sidebar.js:    API_URL = WLO_CONFIG.getApiUrl()
+  │                  → canvas.apiUrl Setter (Fallback)
+  │
+  └── background.js: importScripts('../config.js')
+                     → API_URL für /upload, Schema-Requests
+```
+
+> **Wichtig:** `window.__ENV.agentUrl` wird **vor** den Widget-Scripts gesetzt, damit der i18n-Loader beim Angular-Boot bereits die richtige API-URL kennt. Das verhindert 404-Fehler auf localhost.
+
+Überschreibbar via **Einstellungen** (Options-Seite) — custom URLs werden in `chrome.storage.local` gespeichert und von `sidebar.js` / `background.js` beim Start geladen.
 
 ---
 
@@ -356,7 +376,8 @@ Danach in `chrome://extensions/` → **Aktualisieren** klicken.
 |---------|--------|
 | Webkomponente leer | `chrome://extensions/` → Plugin neu laden |
 | i18n-Texte fehlen | `.\build-extension.ps1` ausführen oder manuell Dateien aus `metadata-agent-api/src/static/widget/dist/` kopieren |
-| API nicht erreichbar | Options → API URL prüfen |
+| i18n 404 auf localhost | `config.js` → `api.url` prüfen — `window.__ENV.agentUrl` muss vor Widget-Scripts gesetzt sein |
+| API nicht erreichbar | `config.js` → `api.url` prüfen, oder Options-Seite → API URL ändern |
 | Login schlägt fehl | Options → Repository URL prüfen |
 | 🛒-Icons fehlen auf WLO | Seite neu laden (Content Scripts werden bei `document_idle` injiziert) |
 | Warenkorb-Items ohne Metadaten | Console prüfen — Enrichment versucht staging + redaktion Server |
