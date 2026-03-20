@@ -1,5 +1,5 @@
 // WLO Metadaten-Agent - Central Configuration
-// VERSION: 7.0.0 — Direct Web Component Integration + FastAPI Backend
+// VERSION: 2.0.0 — Direct Web Component Integration + FastAPI Backend
 
 const WLO_CONFIG = {
     // Metadata Agent FastAPI Backend

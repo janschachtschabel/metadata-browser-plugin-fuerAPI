@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "WLO Metadaten-Agent",
-  "version": "7.0.0",
+  "version": "2.0.0",
   "description": "KI-gestützte Metadaten-Erfassung für WirLernenOnline — mit integrierter Webkomponente und FastAPI-Backend.",
   "homepage_url": "https://wirlernenonline.de/",
   
