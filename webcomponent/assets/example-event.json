@@ -1,6 +1,6 @@
 {
   "contextName": "default",
-  "schemaVersion": "1.8.1",
+  "schemaVersion": "v2.0.0",
   "metadataset": "event.json",
   "language": "de",
   "metadata": {
