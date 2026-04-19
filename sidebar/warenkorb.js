@@ -52,13 +52,15 @@ class Warenkorb {
 
   /**
    * Import items that were queued by the WLO overlay while the sidebar was closed.
+   * The queue lives in chrome.storage (extension-scoped) — never in page-scoped
+   * localStorage — so page scripts cannot inject entries.
    */
-  importPendingItems() {
+  async importPendingItems() {
     try {
-      const raw = localStorage.getItem('wk_pending_items');
-      if (!raw) return;
-      const items = JSON.parse(raw);
-      if (!Array.isArray(items) || items.length === 0) return;
+      const response = await chrome.runtime.sendMessage({ action: 'pendingItems.get' });
+      if (!response?.success) return;
+      const items = Array.isArray(response.data) ? response.data : [];
+      if (items.length === 0) return;
 
       let added = 0;
       for (const item of items) {
@@ -69,7 +71,7 @@ class Warenkorb {
         }
       }
 
-      localStorage.removeItem('wk_pending_items');
+      await chrome.runtime.sendMessage({ action: 'pendingItems.clear' });
 
       if (added > 0) {
         this.renderPhases();
@@ -172,21 +174,28 @@ class Warenkorb {
       </div>`;
     }
 
-    return phase.items.map((item, idx) => `
-      <div class="wk-item" draggable="true" data-item-idx="${idx}" data-phase-id="${phase.id}">
-        ${item.thumbnail ? `<img class="wk-item-thumb" src="${item.thumbnail}" alt="" loading="lazy">` : `<span class="material-icons wk-item-thumb-icon">${WK_CONTENT_TYPES[item.typeId]?.icon || 'description'}</span>`}
+    // Thumbnail and URL come from external APIs — validate both to prevent
+    // javascript:/data: URL injection.
+    return phase.items.map((item, idx) => {
+      const thumb = this.safeImageUrl(item.thumbnail);
+      const link = this.safeLinkUrl(item.url);
+      const type = this.escapeHtml(item.type || 'Material');
+      const iconName = this.escapeHtml(WK_CONTENT_TYPES[item.typeId]?.icon || 'description');
+      return `
+      <div class="wk-item" draggable="true" data-item-idx="${idx}" data-phase-id="${this.escapeHtml(phase.id)}">
+        ${thumb ? `<img class="wk-item-thumb" src="${thumb}" alt="" loading="lazy">` : `<span class="material-icons wk-item-thumb-icon">${iconName}</span>`}
         <div class="wk-item-info">
           <div class="wk-item-title">${this.escapeHtml(item.title)}</div>
-          <div class="wk-item-type">${item.type || 'Material'}</div>
+          <div class="wk-item-type">${type}</div>
         </div>
         <div class="wk-item-actions">
-          ${item.url ? `<a href="${item.url}" target="_blank" class="wk-item-link" title="Öffnen"><span class="material-icons">open_in_new</span></a>` : ''}
-          <button class="wk-item-remove" data-phase-id="${phase.id}" data-item-idx="${idx}" title="Entfernen">
+          ${link ? `<a href="${link}" target="_blank" rel="noopener noreferrer" class="wk-item-link" title="Öffnen"><span class="material-icons">open_in_new</span></a>` : ''}
+          <button class="wk-item-remove" data-phase-id="${this.escapeHtml(phase.id)}" data-item-idx="${idx}" title="Entfernen">
             <span class="material-icons">close</span>
           </button>
         </div>
-      </div>
-    `).join('');
+      </div>`;
+    }).join('');
   }
 
   renderSearchResults(phaseId, results) {
@@ -199,25 +208,30 @@ class Warenkorb {
       return;
     }
 
+    const safePhaseId = this.escapeHtml(phaseId);
     container.innerHTML = `
       <div class="wk-results-header">
         <span>${results.length} Ergebnis${results.length > 1 ? 'se' : ''}</span>
-        <button class="wk-results-close" data-phase-id="${phaseId}">
+        <button class="wk-results-close" data-phase-id="${safePhaseId}">
           <span class="material-icons">close</span>
         </button>
       </div>
-      ${results.map((item, idx) => `
-        <div class="wk-result" data-result-idx="${idx}" data-phase-id="${phaseId}">
-          ${item.thumbnail ? `<img class="wk-result-thumb" src="${item.thumbnail}" alt="" loading="lazy">` : `<span class="material-icons wk-result-thumb-icon">${WK_CONTENT_TYPES[item.typeId]?.icon || 'description'}</span>`}
+      ${results.map((item, idx) => {
+        const thumb = this.safeImageUrl(item.thumbnail);
+        const iconName = this.escapeHtml(WK_CONTENT_TYPES[item.typeId]?.icon || 'description');
+        const meta = this.escapeHtml((item.type || '') + (item.author ? ' · ' + item.author : ''));
+        return `
+        <div class="wk-result" data-result-idx="${idx}" data-phase-id="${safePhaseId}">
+          ${thumb ? `<img class="wk-result-thumb" src="${thumb}" alt="" loading="lazy">` : `<span class="material-icons wk-result-thumb-icon">${iconName}</span>`}
           <div class="wk-result-info">
             <div class="wk-result-title">${this.escapeHtml(item.title)}</div>
-            <div class="wk-result-meta">${item.type}${item.author ? ' · ' + item.author : ''}</div>
+            <div class="wk-result-meta">${meta}</div>
           </div>
-          <button class="wk-result-add" data-result-idx="${idx}" data-phase-id="${phaseId}" title="Hinzufügen">
+          <button class="wk-result-add" data-result-idx="${idx}" data-phase-id="${safePhaseId}" title="Hinzufügen">
             <span class="material-icons">add_circle</span>
           </button>
-        </div>
-      `).join('')}
+        </div>`;
+      }).join('')}
     `;
 
     // Store results for adding
@@ -860,58 +874,66 @@ class Warenkorb {
       weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'
     });
 
+    const esc = (v) => this.escapeHtml(v);
+    const safeImg = (v) => this.safeImageUrl(v);
+    const safeLink = (v) => this.safeLinkUrl(v);
+
+    const titlePart = this.metadata.title ? ' – ' + this.metadata.title : '';
+    const style = `
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      body { font-family: 'Segoe UI', Tahoma, sans-serif; font-size: 12pt; line-height: 1.5; color: #1e293b; padding: 40px; max-width: 210mm; margin: 0 auto; }
+      h1 { font-size: 22pt; margin-bottom: 6px; color: #003B7C; }
+      h2 { font-size: 15pt; margin: 20px 0 10px; color: #334155; border-bottom: 2px solid #e2e8f0; padding-bottom: 4px; }
+      .header { border-bottom: 3px solid #003B7C; padding-bottom: 16px; margin-bottom: 20px; }
+      .meta { display: flex; flex-wrap: wrap; gap: 20px; font-size: 11pt; color: #64748b; margin-top: 10px; }
+      .meta b { color: #1e293b; }
+      .pattern { background: #f1f5f9; padding: 12px 16px; border-radius: 8px; margin-bottom: 20px; }
+      .pattern-name { font-weight: 600; font-size: 13pt; }
+      .pattern-desc { color: #64748b; font-size: 11pt; margin-top: 2px; }
+      .phase { border: 1px solid #e2e8f0; border-radius: 8px; margin-bottom: 14px; page-break-inside: avoid; }
+      .phase-hdr { background: #f1f5f9; padding: 10px 14px; border-radius: 8px 8px 0 0; display: flex; align-items: center; gap: 10px; }
+      .phase-title { font-weight: 600; font-size: 12pt; }
+      .phase-dur { margin-left: auto; font-size: 10pt; color: #64748b; background: white; padding: 3px 10px; border-radius: 4px; }
+      .phase-body { padding: 12px 14px; }
+      .phase-desc { color: #64748b; font-style: italic; margin-bottom: 10px; font-size: 11pt; }
+      .material { display: flex; gap: 10px; padding: 8px; background: #f8fafc; border-radius: 6px; margin-bottom: 6px; align-items: flex-start; }
+      .mat-preview { width: 150px; min-width: 150px; height: auto; border-radius: 4px; object-fit: cover; }
+      .mat-type { background: #e2e8f0; padding: 2px 8px; border-radius: 4px; font-size: 9pt; white-space: nowrap; }
+      .mat-title { font-weight: 500; font-size: 11pt; }
+      .mat-desc { font-size: 9pt; color: #64748b; margin: 2px 0; line-height: 1.4; }
+      .mat-url { font-size: 9pt; color: #2563eb; word-break: break-all; }
+      .empty-phase { color: #94a3b8; font-style: italic; text-align: center; padding: 16px; }
+      .diff { background: #fef3c7; border: 1px solid #fcd34d; border-radius: 8px; padding: 14px; margin-top: 20px; }
+      .diff h3 { color: #92400e; margin-bottom: 8px; }
+      .diff-tag { background: #fef9c3; padding: 2px 10px; border-radius: 12px; font-size: 10pt; font-weight: 500; display: inline-block; margin: 2px 4px; }
+      .footer { margin-top: 30px; padding-top: 14px; border-top: 1px solid #e2e8f0; font-size: 9pt; color: #94a3b8; text-align: center; }
+      @media print { body { padding: 20px; } .phase { break-inside: avoid; } }
+    `;
+
     const html = `<!DOCTYPE html>
 <html lang="de">
 <head>
   <meta charset="UTF-8">
-  <title>Unterrichtsentwurf${this.metadata.title ? ' – ' + this.metadata.title : ''}</title>
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: 'Segoe UI', Tahoma, sans-serif; font-size: 12pt; line-height: 1.5; color: #1e293b; padding: 40px; max-width: 210mm; margin: 0 auto; }
-    h1 { font-size: 22pt; margin-bottom: 6px; color: #003B7C; }
-    h2 { font-size: 15pt; margin: 20px 0 10px; color: #334155; border-bottom: 2px solid #e2e8f0; padding-bottom: 4px; }
-    .header { border-bottom: 3px solid #003B7C; padding-bottom: 16px; margin-bottom: 20px; }
-    .meta { display: flex; flex-wrap: wrap; gap: 20px; font-size: 11pt; color: #64748b; margin-top: 10px; }
-    .meta b { color: #1e293b; }
-    .pattern { background: #f1f5f9; padding: 12px 16px; border-radius: 8px; margin-bottom: 20px; }
-    .pattern-name { font-weight: 600; font-size: 13pt; }
-    .pattern-desc { color: #64748b; font-size: 11pt; margin-top: 2px; }
-    .phase { border: 1px solid #e2e8f0; border-radius: 8px; margin-bottom: 14px; page-break-inside: avoid; }
-    .phase-hdr { background: #f1f5f9; padding: 10px 14px; border-radius: 8px 8px 0 0; display: flex; align-items: center; gap: 10px; }
-    .phase-title { font-weight: 600; font-size: 12pt; }
-    .phase-dur { margin-left: auto; font-size: 10pt; color: #64748b; background: white; padding: 3px 10px; border-radius: 4px; }
-    .phase-body { padding: 12px 14px; }
-    .phase-desc { color: #64748b; font-style: italic; margin-bottom: 10px; font-size: 11pt; }
-    .material { display: flex; gap: 10px; padding: 8px; background: #f8fafc; border-radius: 6px; margin-bottom: 6px; align-items: flex-start; }
-    .mat-preview { width: 150px; min-width: 150px; height: auto; border-radius: 4px; object-fit: cover; }
-    .mat-type { background: #e2e8f0; padding: 2px 8px; border-radius: 4px; font-size: 9pt; white-space: nowrap; }
-    .mat-title { font-weight: 500; font-size: 11pt; }
-    .mat-desc { font-size: 9pt; color: #64748b; margin: 2px 0; line-height: 1.4; }
-    .mat-url { font-size: 9pt; color: #2563eb; word-break: break-all; }
-    .empty-phase { color: #94a3b8; font-style: italic; text-align: center; padding: 16px; }
-    .diff { background: #fef3c7; border: 1px solid #fcd34d; border-radius: 8px; padding: 14px; margin-top: 20px; }
-    .diff h3 { color: #92400e; margin-bottom: 8px; }
-    .diff-tag { background: #fef9c3; padding: 2px 10px; border-radius: 12px; font-size: 10pt; font-weight: 500; display: inline-block; margin: 2px 4px; }
-    .footer { margin-top: 30px; padding-top: 14px; border-top: 1px solid #e2e8f0; font-size: 9pt; color: #94a3b8; text-align: center; }
-    @media print { body { padding: 20px; } .phase { break-inside: avoid; } }
-  </style>
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src https: data:; font-src 'self';">
+  <title>Unterrichtsentwurf${esc(titlePart)}</title>
+  <style>${style}</style>
 </head>
 <body>
   <div class="header">
     <h1>Unterrichtsentwurf</h1>
-    ${this.metadata.title ? `<div style="font-size:16pt;font-weight:600;margin:4px 0;">${this.escapeHtml(this.metadata.title)}</div>` : ''}
+    ${this.metadata.title ? `<div style="font-size:16pt;font-weight:600;margin:4px 0;">${esc(this.metadata.title)}</div>` : ''}
     <div class="meta">
-      <span><b>Datum:</b> ${today}</span>
-      ${this.filters.discipline ? `<span><b>Fach:</b> ${this.escapeHtml(this.getFilterLabel('discipline', this.filters.discipline))}</span>` : ''}
-      ${this.filters.educationalContext ? `<span><b>Stufe:</b> ${this.escapeHtml(this.getFilterLabel('eduContext', this.filters.educationalContext))}</span>` : ''}
-      ${this.metadata.duration ? `<span><b>Dauer:</b> ${this.escapeHtml(this.metadata.duration)}</span>` : ''}
+      <span><b>Datum:</b> ${esc(today)}</span>
+      ${this.filters.discipline ? `<span><b>Fach:</b> ${esc(this.getFilterLabel('discipline', this.filters.discipline))}</span>` : ''}
+      ${this.filters.educationalContext ? `<span><b>Stufe:</b> ${esc(this.getFilterLabel('eduContext', this.filters.educationalContext))}</span>` : ''}
+      ${this.metadata.duration ? `<span><b>Dauer:</b> ${esc(this.metadata.duration)}</span>` : ''}
       <span><b>Materialien:</b> ${totalItems}</span>
     </div>
   </div>
 
   <div class="pattern">
-    <div class="pattern-name">${this.currentPattern.name}</div>
-    <div class="pattern-desc">${this.currentPattern.description}</div>
+    <div class="pattern-name">${esc(this.currentPattern.name)}</div>
+    <div class="pattern-desc">${esc(this.currentPattern.description)}</div>
   </div>
 
   <h2>Unterrichtsverlauf</h2>
@@ -919,21 +941,27 @@ class Warenkorb {
   ${this.phases.map(phase => `
   <div class="phase">
     <div class="phase-hdr">
-      <span class="phase-title">${phase.name}</span>
-      <span class="phase-dur">${phase.duration}</span>
+      <span class="phase-title">${esc(phase.name)}</span>
+      <span class="phase-dur">${esc(phase.duration)}</span>
     </div>
     <div class="phase-body">
-      <div class="phase-desc">${phase.description}</div>
+      <div class="phase-desc">${esc(phase.description)}</div>
       ${phase.items.length > 0 ? phase.items.map(item => {
-        const displayUrl = item.url || (item.nodeId ? `https://suche.wirlernenonline.de/search/de/detail/${item.nodeId}` : '');
+        const fallbackUrl = item.nodeId && /^[a-z0-9-]+$/i.test(item.nodeId)
+          ? `https://suche.wirlernenonline.de/search/de/detail/${encodeURIComponent(item.nodeId)}`
+          : '';
+        const linkHref = safeLink(item.url) || fallbackUrl;
+        const thumbSrc = safeImg(item.thumbnail);
+        const description = typeof item.description === 'string' ? item.description : '';
+        const truncated = description.substring(0, 250);
         return `
       <div class="material">
-        ${item.thumbnail ? `<img class="mat-preview" src="${item.thumbnail}" alt="">` : ''}
+        ${thumbSrc ? `<img class="mat-preview" src="${esc(thumbSrc)}" alt="">` : ''}
         <div>
-          <span class="mat-type">${item.type || 'Material'}</span>
-          <div class="mat-title">${this.escapeHtml(item.title)}</div>
-          ${item.description ? `<div class="mat-desc">${this.escapeHtml(item.description.substring(0, 250))}${item.description.length > 250 ? '…' : ''}</div>` : ''}
-          ${displayUrl ? `<div class="mat-url"><a href="${displayUrl}" target="_blank">${displayUrl}</a></div>` : ''}
+          <span class="mat-type">${esc(item.type || 'Material')}</span>
+          <div class="mat-title">${esc(item.title)}</div>
+          ${description ? `<div class="mat-desc">${esc(truncated)}${description.length > 250 ? '…' : ''}</div>` : ''}
+          ${linkHref ? `<div class="mat-url"><a href="${esc(linkHref)}" target="_blank" rel="noopener noreferrer">${esc(linkHref)}</a></div>` : ''}
         </div>
       </div>`;
       }).join('') : '<div class="empty-phase">Noch keine Materialien zugeordnet</div>'}
@@ -943,7 +971,7 @@ class Warenkorb {
   ${this.selectedDiff.length > 0 ? `
   <div class="diff">
     <h3>Binnendifferenzierung</h3>
-    ${this.selectedDiff.map(d => `<span class="diff-tag">${this.escapeHtml(d.name)}</span>`).join('')}
+    ${this.selectedDiff.map(d => `<span class="diff-tag">${esc(d.name)}</span>`).join('')}
   </div>` : ''}
 
   <div class="footer">
@@ -952,12 +980,19 @@ class Warenkorb {
 </body>
 </html>`;
 
-    const printWindow = window.open('', '_blank');
+    // Render into a sandboxed Blob URL so the print document cannot touch the
+    // extension's DOM, storage, or cookies if a value in the template somehow
+    // escapes the escape function.
+    const blob = new Blob([html], { type: 'text/html' });
+    const blobUrl = URL.createObjectURL(blob);
+    const printWindow = window.open(blobUrl, '_blank', 'noopener,noreferrer');
     if (printWindow) {
-      printWindow.document.write(html);
-      printWindow.document.close();
-      setTimeout(() => printWindow.print(), 500);
+      // Give the tab a moment to parse before offering print.
+      setTimeout(() => {
+        try { printWindow.focus(); printWindow.print(); } catch { /* ignore */ }
+      }, 500);
     }
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
   }
 
   // =========================================================================
@@ -978,8 +1013,33 @@ class Warenkorb {
   }
 
   escapeHtml(str) {
-    if (!str) return '';
-    return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    if (str === null || str === undefined) return '';
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  // Only http(s) images are allowed — blocks javascript:, data: text/html, etc.
+  safeImageUrl(raw) {
+    if (typeof raw !== 'string' || !raw) return '';
+    if (raw.startsWith('data:image/')) return raw;
+    try {
+      const u = new URL(raw);
+      if (u.protocol === 'https:' || u.protocol === 'http:') return u.href;
+    } catch { /* fall through */ }
+    return '';
+  }
+
+  safeLinkUrl(raw) {
+    if (typeof raw !== 'string' || !raw) return '';
+    try {
+      const u = new URL(raw);
+      if (u.protocol === 'https:' || u.protocol === 'http:') return u.href;
+    } catch { /* fall through */ }
+    return '';
   }
 }
 

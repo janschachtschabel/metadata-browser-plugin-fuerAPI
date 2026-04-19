@@ -1,8 +1,9 @@
 # WLO Metadaten-Agent — Browser Plugin
 
-**Version:** 7.0.0  
+**Version:** 2.1.0  
 **Browser:** Chrome, Edge (Manifest V3)  
-**Kein iframe** — die Angular-Webkomponente läuft direkt in der Sidebar
+**Kein iframe** — die Angular-Webkomponente läuft direkt in der Sidebar  
+**Datenschutz:** siehe [PRIVACY.md](./PRIVACY.md)
 
 ---
 
@@ -96,17 +97,20 @@ Webseiten vormerken und später erschließen. Alle Uploads werden im Verlauf ges
 
 ```
 metadata-browser-plugin-fuerAPI/
-├── manifest.json                 # Manifest V3 — Berechtigungen, Content Scripts
-├── config.js                     # Zentrale Konfiguration (API, Repository, Gast)
+├── manifest.json                 # Manifest V3 — Berechtigungen, Content Scripts, CSP
+├── config.js                     # Zentrale Konfiguration (API, Repository, Timeouts)
+├── PRIVACY.md                    # Datenschutzerklärung (für Chrome Web Store)
 ├── build-extension.ps1           # Build-Script: Webkomponente bauen + kopieren
 │
 ├── background/
-│   └── background.js             # Service Worker: Auth, Upload (VCARD, Geo, Aspects), Queue, History
-│                                # Lädt config.js via importScripts() (keine hardcoded URLs)
+│   └── background.js             # Service Worker: Auth, Upload, Queue, History
+│                                 # fetch mit Timeout/AbortController, URL-Whitelist,
+│                                 # Action-Whitelist für Messages, API-Response-Validation
 │
 ├── sidebar/
-│   ├── sidebar.html              # Sidebar UI: config.js → window.__ENV → Widget-Scripts
-│   ├── sidebar.js                # Event-Bridge: Web Component ↔ Plugin
+│   ├── sidebar.html              # Sidebar UI: config.js → init-env.js → Widget-Scripts
+│   ├── init-env.js               # Setzt window.__ENV aus Config (externes Script wegen CSP)
+│   ├── sidebar.js                # Event-Bridge Web Component ↔ Plugin, XSS-sicheres Rendering
 │   ├── sidebar.css               # Material Design v3 Styles
 │   ├── warenkorb.js              # Warenkorb-Controller (Phasen, Drag & Drop, Export)
 │   ├── warenkorb-api.js          # WLO edu-sharing ngsearch API + Enrichment
@@ -114,12 +118,14 @@ metadata-browser-plugin-fuerAPI/
 │   └── assets/                   # Icons, Bilder
 │
 ├── content/
-│   ├── content.js                # Page Data Extraction (Meta, OG, DC, Schema.org)
-│   ├── wlo-overlay.js            # 🛒-Overlay auf WLO-Suchergebnissen
+│   ├── content.js                # Page Data Extraction — on-demand via
+│   │                             # chrome.scripting.executeScript (keine Auto-Injektion)
+│   ├── wlo-overlay.js            # 🛒-Overlay auf WLO-Suchergebnissen (postMessage
+│   │                             # mit Origin-Check, pendingItems via chrome.storage)
 │   └── wlo-interceptor.js        # Fängt WLO-Such-API-Responses (MAIN world)
 │
 ├── options/
-│   ├── options.html              # Einstellungen: API URL, Repo URL, Login
+│   ├── options.html              # Einstellungen: API URL, Repo URL, Login (Whitelist-validiert)
 │   ├── options.js
 │   └── options.css
 │
@@ -149,18 +155,22 @@ const WLO_CONFIG = {
     repository: {
         url: 'https://repository.staging.openeduhub.net'
     },
-    guest: {
-        inboxId: '...',
-        username: 'WLO-Upload',
-        password: '...'
-    },
     webcomponent: {
         layout: 'plugin',
         theme: 'edu-sharing',
         highlightAi: false
+    },
+    network: {
+        defaultTimeoutMs: 20000,
+        uploadTimeoutMs: 60000
     }
 };
 ```
+
+> **Hinweis:** Gast-Uploads laufen serverseitig über `/upload` des API-Backends.
+> Die Extension hält **keine** Gastzugangsdaten vor (vormals `WLO_CONFIG.guest`
+> wurde entfernt — die Credentials liegen nur noch als ENV-Variable auf dem
+> Backend: `WLO_GUEST_USERNAME`, `WLO_GUEST_PASSWORD`).
 
 ### URL-Fluss
 
@@ -169,19 +179,27 @@ Die API-URL fließt aus `config.js` in alle Komponenten:
 ```
 config.js (WLO_CONFIG.api.url)
   │
-  ├── sidebar.html:   window.__ENV = { agentUrl: WLO_CONFIG.api.url }
-  │                  → Angular bootet mit korrekter URL (i18n, Schema)
+  ├── sidebar/init-env.js:  window.__ENV = { agentUrl: WLO_CONFIG.api.url }
+  │                         → Angular bootet mit korrekter URL (i18n, Schema)
+  │                         (externe Datei — strikte CSP verbietet Inline-Script)
   │
-  ├── sidebar.js:    API_URL = WLO_CONFIG.getApiUrl()
-  │                  → canvas.apiUrl Setter (Fallback)
+  ├── sidebar.js:           API_URL = WLO_CONFIG.getApiUrl()
+  │                         → canvas.apiUrl Setter (Fallback)
   │
-  └── background.js: importScripts('../config.js')
-                     → API_URL für /upload, Schema-Requests
+  └── background.js:        importScripts('../config.js')
+                            → API_URL für /upload, Schema-Requests
 ```
 
-> **Wichtig:** `window.__ENV.agentUrl` wird **vor** den Widget-Scripts gesetzt, damit der i18n-Loader beim Angular-Boot bereits die richtige API-URL kennt. Das verhindert 404-Fehler auf localhost.
+> **Wichtig:** `init-env.js` wird **vor** den Widget-Scripts eingebunden, damit der i18n-Loader beim Angular-Boot bereits die richtige API-URL kennt.
 
-Überschreibbar via **Einstellungen** (Options-Seite) — custom URLs werden in `chrome.storage.local` gespeichert und von `sidebar.js` / `background.js` beim Start geladen.
+### URL-Overrides (Options)
+
+In den Einstellungen eingetragene API- oder Repository-URLs werden **nur** akzeptiert, wenn sie zu folgender Whitelist passen (Härtung gegen unkontrollierte Datenabflüsse):
+
+- API: `https://metadata-agent-api.vercel.app`
+- Repository: `https://repository.staging.openeduhub.net`, `https://redaktion.openeduhub.net`
+
+Andere URLs werden im UI abgelehnt. Auch die CSP (`connect-src`) erzwingt dies serverseitig-unabhängig.
 
 ---
 
@@ -192,11 +210,14 @@ config.js (WLO_CONFIG.api.url)
 ```
 1. User klickt „Erschließung starten"
 2. sidebar.js → background.js: tabs.extractPageData
-3. background.js → content.js: extractPageData (Meta, OG, DC, Schema.org, Text)
-4. sidebar.js: feedDataToCanvas(text, url)
+3. background.js injiziert content.js via chrome.scripting.executeScript
+   (on-demand, nicht persistent)
+4. content.js extrahiert Meta, OG, DC, Schema.org, Text und gibt das
+   Ergebnis synchron als executeScript-Result zurück
+5. sidebar.js: feedDataToCanvas(text, url)
    → Setzt inputMode, userText/sourceUrl auf <metadata-agent-canvas>
-5. Webkomponente → Backend /generate: Text + Schema → KI-Metadaten
-6. Webkomponente zeigt Ergebnisse an (editierbar)
+6. Webkomponente → Backend /generate: Text + Schema → KI-Metadaten
+7. Webkomponente zeigt Ergebnisse an (editierbar)
 ```
 
 ### Upload
@@ -208,9 +229,10 @@ config.js (WLO_CONFIG.api.url)
    beim Unwrapping der verschachtelten Metadaten → nötig für Extended Data
 4. sidebar.js → chrome.runtime.sendMessage({action: 'saveMetadata'})
 5. background.js prüft Login-Status:
-   → User-Modus: Node im User-Home erstellen
-   → Gast-Modus: Node in Gast-Inbox + Workflow starten
-6. Duplikat-Check (ccm:wwwurl) vor Upload
+   → User-Modus: background.js schreibt direkt ins User-Home (mit authHeader)
+   → Gast-Modus: background.js delegiert an API `POST /upload` — KEINE Credentials
+     in der Extension, Upload läuft serverseitig mit `WLO_GUEST_USERNAME/PASSWORD`
+6. Duplikat-Check (ccm:wwwurl) vor Upload (nur User-Modus; Gast: API erledigt es)
 7. Node erstellen (POST .../children)
 8. Aspects setzen (cm:geographic, cm:author falls nötig)
 9. Metadaten schreiben (POST .../metadata?obeyMds=false)
@@ -220,7 +242,7 @@ config.js (WLO_CONFIG.api.url)
 10. Extended Fields schreiben (ccm:oeh_extendedType/Data/Text)
     → User-Modus: background.js schreibt direkt (writeExtendedFields)
     → Gast-Modus: API /upload schreibt (write_extended_data=true)
-11. Workflow starten (nur Gast-Modus)
+11. Workflow starten (nur Gast-Modus, im API-Backend)
 12. Ergebnis → Success/Duplicate Modal + History-Eintrag
 ```
 
@@ -286,22 +308,28 @@ Beim Hinzufügen eines Items wird automatisch nach vollständigen Metadaten gesu
 
 ## Authentifizierung
 
-| Modus | Upload-Ziel | Workflow |
-|-------|-------------|----------|
-| **User** | User Home-Verzeichnis | Kein Workflow nötig |
-| **Gast** | Gast-Inbox | Workflow → WLO-Uploadmanager |
+| Modus | Wer macht den Upload? | Upload-Ziel | Workflow |
+|-------|----------------------|-------------|----------|
+| **User** | Extension (Basic Auth gegen Repository) | User Home-Verzeichnis | Kein Workflow nötig |
+| **Gast** | API-Backend (`/upload`) serverseitig | Gast-Inbox | Workflow → WLO-Uploadmanager |
 
-Login über die Sidebar oder Options-Seite. Session wird in `chrome.storage.local` gespeichert.
+- **Session-Ablauf:** 8 Stunden nach Login — danach wird der `authHeader`
+  automatisch aus `chrome.storage.local` entfernt.
+- **Logout:** löscht sowohl die Session in der Extension als auch serverseitig
+  (`/destroySession`).
+- **Gast-Modus:** benötigt **keine** Anmeldedaten in der Extension. Die Credentials
+  liegen ausschließlich als Env-Variablen auf dem API-Backend
+  (`WLO_GUEST_USERNAME`, `WLO_GUEST_PASSWORD`).
 
 ---
 
 ## Content Scripts
 
-| Script | Kontext | Seiten | Zweck |
-|--------|---------|--------|-------|
-| `content.js` | ISOLATED | Alle URLs | Seitentext + Metadaten extrahieren |
-| `wlo-interceptor.js` | MAIN | wirlernenonline.de | Such-API-Responses abfangen |
-| `wlo-overlay.js` | ISOLATED | wirlernenonline.de | 🛒-Icons auf Suchergebnissen |
+| Script | Kontext | Seiten / Trigger | Zweck |
+|--------|---------|------------------|-------|
+| `content.js` | ISOLATED | **On-demand** via `chrome.scripting.executeScript` | Seitentext + Metadaten extrahieren — erst bei aktivem Klick auf „Erschließen" |
+| `wlo-interceptor.js` | MAIN | `suche.wirlernenonline.de` / `*.wirlernenonline.de` | Such-API-Responses abfangen |
+| `wlo-overlay.js` | ISOLATED | `suche.wirlernenonline.de` / `*.wirlernenonline.de` | 🛒-Icons auf Suchergebnissen |
 
 ### wlo-interceptor.js
 
@@ -309,7 +337,15 @@ Läuft im **MAIN world** (Seitenkontext) und überschreibt `fetch()` sowie `XMLH
 
 ### wlo-overlay.js
 
-Injiziert 🛒-Buttons auf jeder Suchergebnis-Kachel. Beim Klick wird das Item an die aktive Warenkorb-Phase gesendet. Nutzt einen NodeId-Cache aus den intercepteten API-Responses für schnelle und präzise Zuordnung.
+Injiziert 🛒-Buttons auf jeder Suchergebnis-Kachel. Beim Klick wird das Item an die aktive Warenkorb-Phase gesendet. Nutzt einen NodeId-Cache aus den intercepteten API-Responses.
+
+**Sicherheits-Härtung:**
+- `postMessage`-Listener prüft `event.source === window && event.origin === location.origin`.
+- Pendenzen (Items die eingelegt wurden, während die Sidebar zu war) werden in `chrome.storage.local` (Extension-scoped) zwischengespeichert, nicht in Page-`localStorage`.
+
+### content.js (on-demand)
+
+Kein Auto-Inject auf `<all_urls>`. Die Extension injiziert `content.js` erst, wenn der User aktiv „Erschließen" klickt — dann wird die Seite einmalig ausgelesen, das Script beendet sich und hinterlässt keinen Listener in der Seite.
 
 ---
 
@@ -358,15 +394,40 @@ Danach in `chrome://extensions/` → **Aktualisieren** klicken.
 
 | Berechtigung | Zweck |
 |-------------|-------|
-| `activeTab` | Aktuellen Tab auslesen |
-| `scripting` | Content Script injizieren |
+| `activeTab` | On-Demand-Zugriff auf den aktuellen Tab (beim User-Klick) |
+| `tabs` | URL und Titel des aktiven Tabs lesen (nur Metadaten, kein Inhalt) |
+| `scripting` | Content Script on-demand injizieren für Seitenextraktion |
 | `storage` | Session, Queue, History, Warenkorb speichern |
 | `sidePanel` | Sidebar UI |
 | `contextMenus` | Rechtsklick → „Zur Merkliste" |
 | `notifications` | Feedback-Benachrichtigungen |
-| `host_permissions: *` | API-Calls zu Backend + Repository |
+| `host_permissions: https://*/*` | Extraktion der gerade geöffneten Seite für die Erschließung (nur HTTPS, kein HTTP) |
 
-**CSP:** `script-src 'self'; object-src 'self'` — keine externen Scripts nötig.
+**Netzwerk-Whitelist:** Obwohl `host_permissions` HTTPS-weit ist, kontaktiert die Extension tatsächlich **nur** folgende Hosts — sowohl per Code-Sanitizer als auch per CSP erzwungen:
+
+- `https://metadata-agent-api.vercel.app` (API-Backend)
+- `https://repository.staging.openeduhub.net` (edu-sharing Repository)
+- `https://redaktion.openeduhub.net` (Warenkorb-Suche)
+- `https://*.wirlernenonline.de` (nur Content-Script, kein fetch)
+
+**CSP (`extension_pages`):**
+```
+default-src 'self';
+script-src 'self';
+style-src 'self' 'unsafe-inline' https://fonts.googleapis.com;
+font-src 'self' https://fonts.gstatic.com;
+img-src 'self' data: https:;
+connect-src 'self' https://metadata-agent-api.vercel.app
+    https://repository.staging.openeduhub.net
+    https://redaktion.openeduhub.net
+    https://*.wirlernenonline.de;
+frame-ancestors 'none';
+object-src 'none';
+base-uri 'self';
+form-action 'self'
+```
+
+Keine Inline-Scripts, keine externen Scripts, kein `eval`.
 
 ---
 
@@ -376,12 +437,69 @@ Danach in `chrome://extensions/` → **Aktualisieren** klicken.
 |---------|--------|
 | Webkomponente leer | `chrome://extensions/` → Plugin neu laden |
 | i18n-Texte fehlen | `.\build-extension.ps1` ausführen oder manuell Dateien aus `metadata-agent-api/src/static/widget/dist/` kopieren |
-| i18n 404 auf localhost | `config.js` → `api.url` prüfen — `window.__ENV.agentUrl` muss vor Widget-Scripts gesetzt sein |
+| i18n 404 auf localhost | `config.js` → `api.url` prüfen — `init-env.js` muss vor Widget-Scripts geladen sein |
 | API nicht erreichbar | `config.js` → `api.url` prüfen, oder Options-Seite → API URL ändern |
 | Login schlägt fehl | Options → Repository URL prüfen |
 | 🛒-Icons fehlen auf WLO | Seite neu laden (Content Scripts werden bei `document_idle` injiziert) |
 | Warenkorb-Items ohne Metadaten | Console prüfen — Enrichment versucht staging + redaktion Server |
 | Violette KI-Textfarbe | `highlight-ai="false"` in sidebar.html + `highlightAi: false` in config.js |
+
+---
+
+## Chrome Web Store — Einreichungs-Checkliste
+
+Die Extension erfüllt alle **technischen** Anforderungen für eine Einreichung.
+Vor dem eigentlichen Submit müssen noch **organisatorische** Punkte erledigt
+werden:
+
+### ✅ Bereits erfüllt
+
+- [x] Manifest V3, Service Worker, kein Remote-Code
+- [x] Minimale Permissions + Justification (siehe [PRIVACY.md](./PRIVACY.md))
+- [x] Keine hartkodierten Credentials
+- [x] Vollständige CSP, keine Inline-Scripts
+- [x] On-Demand-Injection (kein persistentes Auto-Content-Script auf `<all_urls>`)
+- [x] XSS-sicheres DOM-Rendering + URL-Sanitizing
+- [x] Fetch-Timeouts + API-Response-Validation
+- [x] Privacy Policy ([PRIVACY.md](./PRIVACY.md))
+- [x] Icons in allen Größen (16/32/48/128)
+- [x] `homepage_url` gesetzt
+- [x] Versionsnummer in `manifest.json`
+
+### ⚠️ Vor Submit zu erledigen (organisatorisch)
+
+| Aufgabe | Wo |
+|---|---|
+| **Alte Gast-Credentials rotieren** (`wlo#upload!20` war bis v2.0.0 in `config.js` öffentlich lesbar) | Backend-ENV + edu-sharing |
+| **Privacy Policy öffentlich hosten** (Chrome Store verlangt URL, nicht nur Datei) | z. B. auf wirlernenonline.de/datenschutz-plugin/ |
+| **Permission-Justification im Store-Dashboard ausfüllen** pro Permission (`activeTab`, `tabs`, `scripting`, `storage`, `notifications`, `sidePanel`, `contextMenus`, `host_permissions`) | Developer Dashboard |
+| **Single-Purpose-Description** (Chrome Store Pflicht) | Developer Dashboard |
+| **Data Usage Disclosure** (Welche Daten werden gesammelt / übertragen?) | Developer Dashboard → „Privacy practices" |
+| **Screenshots** (mindestens 1, max. 5, 1280×800 oder 640×400 px) | Listing |
+| **Small Promo Tile** (440×280 px) | Listing |
+| **Detailed Description** (DE + EN empfohlen) | Listing |
+| **Developer-Konto verifizieren** (einmalig, 5 $ Gebühr) | Chrome Web Store |
+
+### 🔶 Zu erwarten bei Review
+
+Google prüft bei Extensions mit breiten `host_permissions` besonders genau:
+
+- **„Broad host permissions"-Review:** Dauert in der Regel länger (Tage bis
+  Wochen). Die Begründung in [PRIVACY.md](./PRIVACY.md#warum-steht-im-manifest-host_permissions-https) erklärt
+  den legitimen Use-Case (Metadaten-Extraktion beliebiger Bildungsseiten).
+- **Data Collection:** Muss präzise angegeben werden
+  (URL/Seitentitel/Seiteninhalt → „Personally identifiable information":
+  Nein; „Web history / activity data": Ja, beschränkt auf vom User aktiv
+  ausgewählte Seiten).
+- **Login-Credentials:** Basic-Auth gegen edu-sharing muss erwähnt sein.
+- **Keine Trackers/Analytik** — Vorteil: keine zusätzlichen Disclosures nötig.
+
+### 🔴 Nicht geeignet für Chrome Web Store ohne Nacharbeit
+
+Wenn die Extension **als Muster** für andere Betreiber genutzt werden soll,
+müssen `config.js`, `PRIVACY.md`, `manifest.json` `host_permissions` und die
+Whitelists in `background.js`/`options.js` an die jeweiligen Ziele angepasst
+werden.
 
 ---
 

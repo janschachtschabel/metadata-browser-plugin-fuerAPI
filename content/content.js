@@ -1,31 +1,9 @@
 // WLO Metadaten-Agent - Content Script
-// VERSION: 7.0.0 — Page Data Extraction Only (no iframe injection)
-console.log('🔧 WLO Content Script v7 loaded');
+// VERSION: 8.0.0 — Injected on-demand via chrome.scripting.executeScript.
+// Wrapped in an IIFE so the result is returned directly to the caller.
+// No auto-injection, no persistent message listener.
 
-// Listen for messages from background/sidebar
-chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-    if (request.action === 'extractPageData') {
-        console.log('🔍 Extracting page data...');
-        try {
-            const pageData = extractPageData();
-            sendResponse(pageData);
-        } catch (error) {
-            console.error('❌ Extraction failed:', error);
-            sendResponse({
-                url: window.location.href,
-                title: document.title,
-                html: '',
-                text: '',
-                metadata: {}
-            });
-        }
-        return true;
-    }
-});
-
-// ===========================================================================
-// EXTRACT PAGE DATA
-// ===========================================================================
+(() => {
 
 function extractPageData() {
     const data = {
@@ -301,3 +279,18 @@ function buildFormattedText(data) {
     text += data.mainContent || '';
     return text;
 }
+
+try {
+    return extractPageData();
+} catch (error) {
+    return {
+        url: window.location.href,
+        title: document.title,
+        html: '',
+        text: '',
+        metadata: {},
+        _extractionError: String(error?.message || error)
+    };
+}
+
+})();

@@ -1,11 +1,17 @@
 // WLO Metadaten-Agent - Options/Login Script
-// VERSION: 7.0.0
-console.log('🔧 Options page v7 loaded');
+// VERSION: 8.0.0 — XSS-safe rendering, validated URL overrides, timed fetches.
 
-// Use central configuration (can be overridden via chrome.storage)
+console.log('🔧 Options page v8 loaded');
+
 let REPOSITORY_URL = WLO_CONFIG.getRepositoryUrl();
 
-// DOM Elements - Login
+const ALLOWED_REPO_HOSTS = new Set([
+    'repository.staging.openeduhub.net',
+    'redaktion.openeduhub.net'
+]);
+const ALLOWED_API_HOSTS = new Set(['metadata-agent-api.vercel.app']);
+const SESSION_TIMEOUT_MS = 8 * 60 * 60 * 1000; // 8 hours
+
 const loginForm = document.getElementById('login-form');
 const usernameInput = document.getElementById('username');
 const passwordInput = document.getElementById('password');
@@ -16,7 +22,6 @@ const usernameDisplay = document.getElementById('username-display');
 const permissionsBox = document.getElementById('permissions-box');
 const permissionsList = document.getElementById('permissions-list');
 
-// DOM Elements - Config
 const repositoryUrlInput = document.getElementById('repository-url');
 const saveRepoUrlBtn = document.getElementById('save-repo-url-btn');
 const resetRepoUrlBtn = document.getElementById('reset-repo-url-btn');
@@ -24,352 +29,287 @@ const apiUrlInput = document.getElementById('api-url');
 const saveApiUrlBtn = document.getElementById('save-api-url-btn');
 const resetApiUrlBtn = document.getElementById('reset-api-url-btn');
 
-// DOM Elements - Messages
 const errorBox = document.getElementById('error-box');
 const errorMessage = document.getElementById('error-message');
 const successBox = document.getElementById('success-box');
 const successMessage = document.getElementById('success-message');
 
-// Initialize
 document.addEventListener('DOMContentLoaded', async () => {
-    console.log('🚀 Initializing options page...');
     await loadSession();
     await loadConfigSettings();
     setupEventListeners();
 });
 
-// Setup Event Listeners
 function setupEventListeners() {
-    // Login
     loginForm.addEventListener('submit', handleLogin);
     logoutBtn.addEventListener('click', handleLogout);
-    
-    // Config
     saveRepoUrlBtn.addEventListener('click', handleSaveRepositoryUrl);
     resetRepoUrlBtn.addEventListener('click', handleResetRepositoryUrl);
     saveApiUrlBtn?.addEventListener('click', handleSaveApiUrl);
     resetApiUrlBtn?.addEventListener('click', handleResetApiUrl);
 }
 
-// Load existing session from storage
-async function loadSession() {
+function sanitizeOrigin(rawUrl, allowedHosts) {
+    if (typeof rawUrl !== 'string') return null;
     try {
-        const { wloSession } = await chrome.storage.local.get('wloSession');
-        
-        if (wloSession && wloSession.isValidLogin) {
-            console.log('✅ Found existing session:', wloSession.authorityName);
-            displayLoginStatus(wloSession);
-        } else {
-            console.log('ℹ️ No active session');
-        }
-    } catch (error) {
-        console.error('❌ Failed to load session:', error);
+        const u = new URL(rawUrl);
+        if (u.protocol !== 'https:') return null;
+        if (!allowedHosts.has(u.hostname)) return null;
+        return u.origin;
+    } catch { return null; }
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 20000) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        return await fetch(url, { ...options, signal: controller.signal });
+    } finally {
+        clearTimeout(timer);
     }
 }
 
-// Handle Login
+async function loadSession() {
+    try {
+        const { wloSession } = await chrome.storage.local.get('wloSession');
+        if (!wloSession || !wloSession.isValidLogin) return;
+        if (typeof wloSession.expiresAt === 'number' && wloSession.expiresAt < Date.now()) {
+            await chrome.storage.local.remove('wloSession');
+            return;
+        }
+        displayLoginStatus(wloSession);
+    } catch (error) {
+        console.error('❌ Failed to load session:', error?.message || error);
+    }
+}
+
 async function handleLogin(e) {
     e.preventDefault();
-    
     const username = usernameInput.value.trim();
     const password = passwordInput.value;
-    
     if (!username || !password) {
         showError('Bitte Benutzername und Passwort eingeben');
         return;
     }
-    
-    // Show loading state
+
+    const btnText = loginBtn.querySelector('.btn-text');
+    const btnIcon = loginBtn.querySelector('.btn-icon');
     loginBtn.disabled = true;
-    loginBtn.innerHTML = '<span class="btn-icon">⏳</span><span class="btn-text">Anmelden...</span>';
-    
+    if (btnIcon) btnIcon.textContent = '⏳';
+    if (btnText) btnText.textContent = 'Anmelden...';
+
     try {
-        console.log('🔐 Attempting login for user:', username);
-        
-        // Create Basic Auth header
         const authHeader = 'Basic ' + btoa(username + ':' + password);
-        
-        // Validate session with WLO
-        const response = await fetch(
+
+        const response = await fetchWithTimeout(
             `${REPOSITORY_URL}/edu-sharing/rest/authentication/v1/validateSession`,
-            {
-                method: 'GET',
-                headers: {
-                    'Authorization': authHeader,
-                    'Accept': 'application/json'
-                },
-                credentials: 'include'
-            }
+            { method: 'GET', headers: { 'Authorization': authHeader, 'Accept': 'application/json' }, credentials: 'include' }
         );
-        
-        if (!response.ok) {
-            throw new Error('Login fehlgeschlagen: ' + response.status);
-        }
-        
+        if (!response.ok) throw new Error('Login fehlgeschlagen: ' + response.status);
+
         const sessionData = await response.json();
-        
-        console.log('📦 Session data:', sessionData);
-        
-        // Check if it's a valid user login (not guest)
+
         if (sessionData.isGuest || sessionData.statusCode === 'GUEST') {
             throw new Error('Gast-Login ist nicht erlaubt. Bitte mit deinem WLO-Account anmelden.');
         }
-        
         if (!sessionData.isValidLogin || sessionData.statusCode !== 'OK') {
             throw new Error('Login fehlgeschlagen: Ungültige Credentials');
         }
-        
-        // Check for create permission
-        const hasCreatePermission = sessionData.toolPermissions?.includes('TOOLPERMISSION_CREATE_ELEMENTS_FILES');
+
+        const hasCreatePermission = Array.isArray(sessionData.toolPermissions)
+            && sessionData.toolPermissions.includes('TOOLPERMISSION_CREATE_ELEMENTS_FILES');
         if (!hasCreatePermission) {
             throw new Error('Dein Account hat keine Berechtigung zum Erstellen von Inhalten');
         }
-        
-        // Get User Home ID
-        const homeResponse = await fetch(
+
+        const homeResponse = await fetchWithTimeout(
             `${REPOSITORY_URL}/edu-sharing/rest/node/v1/nodes/-home-/-inbox-/metadata`,
-            {
-                headers: {
-                    'Authorization': authHeader,
-                    'Accept': 'application/json'
-                },
-                credentials: 'include'
-            }
+            { headers: { 'Authorization': authHeader, 'Accept': 'application/json' }, credentials: 'include' }
         );
-        
-        if (!homeResponse.ok) {
-            throw new Error('Konnte User Home nicht abrufen');
-        }
-        
+        if (!homeResponse.ok) throw new Error('Konnte User Home nicht abrufen');
+
         const homeData = await homeResponse.json();
-        const userHomeId = homeData.node?.ref?.id;
-        
-        if (!userHomeId) {
-            throw new Error('User Home ID nicht gefunden');
-        }
-        
-        console.log('✅ User Home ID:', userHomeId);
-        
-        // Save session to storage
+        const userHomeId = typeof homeData?.node?.ref?.id === 'string' ? homeData.node.ref.id : null;
+        if (!userHomeId) throw new Error('User Home ID nicht gefunden');
+
+        const allowedPermissionPattern = /^[A-Z0-9_]+$/;
+        const filteredPermissions = Array.isArray(sessionData.toolPermissions)
+            ? sessionData.toolPermissions.filter(p => typeof p === 'string' && allowedPermissionPattern.test(p))
+            : [];
+
+        const now = Date.now();
         const sessionToSave = {
-            ...sessionData,
-            username: username,
-            authHeader: authHeader,
-            userHomeId: userHomeId,
-            loginTime: new Date().toISOString()
+            username,
+            authorityName: typeof sessionData.authorityName === 'string' ? sessionData.authorityName : username,
+            toolPermissions: filteredPermissions,
+            isValidLogin: true,
+            isGuest: false,
+            userHomeId,
+            authHeader,
+            loginTime: now,
+            expiresAt: now + SESSION_TIMEOUT_MS
         };
-        
+
         await chrome.storage.local.set({ wloSession: sessionToSave });
-        
-        console.log('✅ Login successful!');
-        
-        // Clear form
+
         passwordInput.value = '';
-        
-        // Show success
-        showSuccess('Erfolgreich angemeldet als ' + sessionData.authorityName);
-        
-        // Display login status
+        showSuccess('Erfolgreich angemeldet als ' + sessionToSave.authorityName);
         displayLoginStatus(sessionToSave);
-        
     } catch (error) {
-        console.error('❌ Login failed:', error);
-        showError(error.message || 'Login fehlgeschlagen');
+        console.error('❌ Login failed:', error?.message || error);
+        showError(error?.message || 'Login fehlgeschlagen');
     } finally {
-        // Reset button
         loginBtn.disabled = false;
-        loginBtn.innerHTML = '<span class="btn-icon">🔓</span><span class="btn-text">Anmelden</span>';
+        if (btnIcon) btnIcon.textContent = '🔓';
+        if (btnText) btnText.textContent = 'Anmelden';
     }
 }
 
-// Handle Logout
 async function handleLogout() {
     try {
-        console.log('🔒 Logging out...');
-        
-        // Get session
         const { wloSession } = await chrome.storage.local.get('wloSession');
-        
-        if (wloSession && wloSession.authHeader) {
-            // Call destroy session endpoint
+        if (wloSession?.authHeader) {
             try {
-                await fetch(
+                await fetchWithTimeout(
                     `${REPOSITORY_URL}/edu-sharing/rest/authentication/v1/destroySession`,
-                    {
-                        headers: {
-                            'Authorization': wloSession.authHeader
-                        },
-                        credentials: 'include'
-                    }
+                    { headers: { 'Authorization': wloSession.authHeader }, credentials: 'include' }
                 );
-            } catch (e) {
-                console.warn('⚠️ Failed to destroy session on server:', e);
-            }
+            } catch (e) { /* ignore server-side failure */ }
         }
-        
-        // Clear storage
+
         await chrome.storage.local.remove('wloSession');
-        
-        console.log('✅ Logged out successfully');
-        
-        // Reset UI
+
         loginStatus.classList.add('hidden');
         logoutBtn.classList.add('hidden');
         loginForm.classList.remove('hidden');
         permissionsBox.classList.add('hidden');
-        
+
         showSuccess('Erfolgreich abgemeldet');
-        
     } catch (error) {
-        console.error('❌ Logout failed:', error);
+        console.error('❌ Logout failed:', error?.message || error);
         showError('Abmelden fehlgeschlagen');
     }
 }
 
-// Display Login Status
 function displayLoginStatus(session) {
     usernameDisplay.textContent = session.authorityName || session.username;
     loginStatus.classList.remove('hidden');
     logoutBtn.classList.remove('hidden');
     loginForm.classList.add('hidden');
-    
-    // Show permissions
-    if (session.toolPermissions && session.toolPermissions.length > 0) {
+
+    const perms = Array.isArray(session.toolPermissions) ? session.toolPermissions : [];
+    if (perms.length > 0) {
         permissionsBox.classList.remove('hidden');
-        permissionsList.innerHTML = session.toolPermissions
-            .map(perm => `<li>${perm}</li>`)
-            .join('');
+        // XSS-safe: textContent per <li>, no innerHTML.
+        permissionsList.replaceChildren(...perms.map(p => {
+            const li = document.createElement('li');
+            li.textContent = String(p);
+            return li;
+        }));
+    } else {
+        permissionsBox.classList.add('hidden');
+        permissionsList.replaceChildren();
     }
 }
 
-// Show Error
 function showError(message) {
     errorMessage.textContent = message;
     errorBox.classList.remove('hidden');
     successBox.classList.add('hidden');
-    
-    setTimeout(() => {
-        errorBox.classList.add('hidden');
-    }, 5000);
+    setTimeout(() => errorBox.classList.add('hidden'), 5000);
 }
 
-// Show Success
 function showSuccess(message) {
     successMessage.textContent = message;
     successBox.classList.remove('hidden');
     errorBox.classList.add('hidden');
-    
-    setTimeout(() => {
-        successBox.classList.add('hidden');
-    }, 3000);
+    setTimeout(() => successBox.classList.add('hidden'), 3000);
 }
 
 // ============================================================================
 // CONFIG MANAGEMENT
 // ============================================================================
 
-// Load config settings from storage
 async function loadConfigSettings() {
     try {
         const { customRepositoryUrl, customApiUrl } = await chrome.storage.local.get([
             'customRepositoryUrl',
             'customApiUrl'
         ]);
-        
-        // Repository URL
-        if (customRepositoryUrl) {
-            repositoryUrlInput.value = customRepositoryUrl;
-            REPOSITORY_URL = customRepositoryUrl;
-        } else {
-            repositoryUrlInput.value = WLO_CONFIG.getRepositoryUrl();
-        }
-        
-        // API URL
+
+        const safeRepo = sanitizeOrigin(customRepositoryUrl, ALLOWED_REPO_HOSTS);
+        repositoryUrlInput.value = safeRepo || WLO_CONFIG.getRepositoryUrl();
+        if (safeRepo) REPOSITORY_URL = safeRepo;
+
         if (apiUrlInput) {
-            apiUrlInput.value = customApiUrl || WLO_CONFIG.getApiUrl();
+            const safeApi = sanitizeOrigin(customApiUrl, ALLOWED_API_HOSTS);
+            apiUrlInput.value = safeApi || WLO_CONFIG.getApiUrl();
         }
-        
-        console.log('✅ Config loaded:', { repository: REPOSITORY_URL, api: apiUrlInput?.value });
     } catch (error) {
-        console.error('❌ Failed to load config settings:', error);
+        console.error('❌ Failed to load config settings:', error?.message || error);
     }
 }
 
-// Handle Save Repository URL
 async function handleSaveRepositoryUrl() {
+    const raw = repositoryUrlInput.value.trim();
+    if (!raw) { showError('Bitte gib eine Repository-URL ein'); return; }
+    const safe = sanitizeOrigin(raw, ALLOWED_REPO_HOSTS);
+    if (!safe) {
+        showError('Nur erlaubte WLO-Hosts (https) sind zugelassen.');
+        return;
+    }
     try {
-        const url = repositoryUrlInput.value.trim();
-        
-        if (!url) {
-            showError('Bitte gib eine Repository-URL ein');
-            return;
-        }
-        
-        // Validate URL format
-        try {
-            new URL(url);
-        } catch (e) {
-            showError('Ungültige URL. Bitte verwende das Format: https://...');
-            return;
-        }
-        
-        await chrome.storage.local.set({ customRepositoryUrl: url });
-        REPOSITORY_URL = url;
-        
-        console.log('✅ Repository URL saved:', url);
+        await chrome.storage.local.set({ customRepositoryUrl: safe });
+        REPOSITORY_URL = safe;
+        repositoryUrlInput.value = safe;
         showSuccess('Repository-URL gespeichert!');
-        
     } catch (error) {
-        console.error('❌ Failed to save repository URL:', error);
+        console.error('❌ Failed to save repository URL:', error?.message || error);
         showError('Fehler beim Speichern der URL');
     }
 }
 
-// Handle Reset Repository URL
 async function handleResetRepositoryUrl() {
     try {
         await chrome.storage.local.remove('customRepositoryUrl');
-        
         const defaultUrl = WLO_CONFIG.getRepositoryUrl();
         repositoryUrlInput.value = defaultUrl;
         REPOSITORY_URL = defaultUrl;
-        
-        console.log('✅ Repository URL reset to default:', defaultUrl);
         showSuccess('Repository-URL zurückgesetzt!');
-        
     } catch (error) {
-        console.error('❌ Failed to reset repository URL:', error);
+        console.error('❌ Failed to reset repository URL:', error?.message || error);
         showError('Fehler beim Zurücksetzen der URL');
     }
 }
 
-// Handle Save API URL
 async function handleSaveApiUrl() {
+    const raw = apiUrlInput.value.trim();
+    if (!raw) { showError('Bitte gib eine API-URL ein'); return; }
+    const safe = sanitizeOrigin(raw, ALLOWED_API_HOSTS);
+    if (!safe) {
+        showError('Nur erlaubte API-Hosts (https) sind zugelassen.');
+        return;
+    }
     try {
-        const url = apiUrlInput.value.trim();
-        if (!url) { showError('Bitte gib eine API-URL ein'); return; }
-        try { new URL(url); } catch (e) { showError('Ungültige URL'); return; }
-        await chrome.storage.local.set({ customApiUrl: url });
-        console.log('✅ API URL saved:', url);
+        await chrome.storage.local.set({ customApiUrl: safe });
+        apiUrlInput.value = safe;
         showSuccess('API-URL gespeichert!');
     } catch (error) {
-        console.error('❌ Failed to save API URL:', error);
+        console.error('❌ Failed to save API URL:', error?.message || error);
         showError('Fehler beim Speichern');
     }
 }
 
-// Handle Reset API URL
 async function handleResetApiUrl() {
     try {
         await chrome.storage.local.remove('customApiUrl');
         const defaultUrl = WLO_CONFIG.getApiUrl();
         if (apiUrlInput) apiUrlInput.value = defaultUrl;
-        console.log('✅ API URL reset:', defaultUrl);
         showSuccess('API-URL zurückgesetzt!');
     } catch (error) {
-        console.error('❌ Failed to reset API URL:', error);
+        console.error('❌ Failed to reset API URL:', error?.message || error);
         showError('Fehler beim Zurücksetzen');
     }
 }
 
-console.log('✅ Options script v7 initialized');
+console.log('✅ Options script v8 initialized');

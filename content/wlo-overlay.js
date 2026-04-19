@@ -21,13 +21,13 @@
   // edu-sharing ngsearch API responses — giving us the EXACT data that
   // suche.wirlernenonline.de received, including all nodeIds.
   window.addEventListener('message', (event) => {
-    if (event.data?.type === 'WK_SEARCH_NODES' && Array.isArray(event.data.nodes)) {
-      // Merge new nodes into cache (avoid duplicates by id)
-      const existingIds = new Set(searchNodesCache.map(n => n.id));
-      const newNodes = event.data.nodes.filter(n => n.id && !existingIds.has(n.id));
-      searchNodesCache = [...searchNodesCache, ...newNodes];
-      console.log('🛒 Intercepted', event.data.nodes.length, 'search nodes → cache total:', searchNodesCache.length);
-    }
+    // Only accept messages from this window (same origin, same frame).
+    if (event.source !== window || event.origin !== location.origin) return;
+    if (!event.data || event.data.type !== 'WK_SEARCH_NODES' || !Array.isArray(event.data.nodes)) return;
+
+    const existingIds = new Set(searchNodesCache.map(n => n.id));
+    const newNodes = event.data.nodes.filter(n => n && typeof n.id === 'string' && n.id && !existingIds.has(n.id));
+    searchNodesCache = [...searchNodesCache, ...newNodes];
   });
 
   /**
@@ -510,12 +510,10 @@
   // =========================================================================
 
   function storeForLater(item) {
+    // Queue the item in the extension's chrome.storage (background) — NOT in page-scoped
+    // localStorage, which would let page scripts read/modify the cart.
     try {
-      const key = 'wk_pending_items';
-      const raw = localStorage.getItem(key);
-      const items = raw ? JSON.parse(raw) : [];
-      items.push(item);
-      localStorage.setItem(key, JSON.stringify(items));
+      chrome.runtime.sendMessage({ action: 'pendingItems.add', item });
     } catch (e) {
       console.warn('WK overlay: could not store item', e);
     }

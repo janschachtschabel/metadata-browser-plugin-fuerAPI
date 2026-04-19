@@ -1,28 +1,74 @@
 // WLO Metadaten-Agent - Background Service Worker
-// VERSION: 8.0.0 — Aligned with API upload logic: repo_field filtering, field-by-field fallback, guest via API
-// Upload logic handles flat metadata format from FastAPI/web component
-console.log('🚀 WLO Background Service Worker v8 loaded');
+// VERSION: 9.0.0 — Hardened: on-demand content script injection, fetch timeouts,
+//                   response validation, secure session storage, no cached credentials.
 
-// ===========================================================================
-// CONFIGURATION (aus zentraler config.js)
-// ===========================================================================
+console.log('🚀 WLO Background Service Worker v9 loaded');
 
 importScripts('../config.js');
 
-let API_URL = WLO_CONFIG.getApiUrl();
-let REPOSITORY_URL = WLO_CONFIG.getRepositoryUrl();
+// ===========================================================================
+// CONFIGURATION
+// ===========================================================================
 
+const API_URL_DEFAULT = WLO_CONFIG.getApiUrl();
+const REPO_URL_DEFAULT = WLO_CONFIG.getRepositoryUrl();
+const DEFAULT_TIMEOUT_MS = WLO_CONFIG.network?.defaultTimeoutMs ?? 20000;
+const UPLOAD_TIMEOUT_MS = WLO_CONFIG.network?.uploadTimeoutMs ?? 60000;
 const MAX_QUEUE_SIZE = 100;
 const MAX_HISTORY_SIZE = 100;
 
-// Custom URLs aus Options-Seite laden (überschreibt Config-Defaults)
+// Only https + known hosts are accepted for custom overrides
+const ALLOWED_API_HOSTS = new Set(['metadata-agent-api.vercel.app']);
+const ALLOWED_REPO_HOSTS = new Set([
+    'repository.staging.openeduhub.net',
+    'redaktion.openeduhub.net'
+]);
+
+let API_URL = API_URL_DEFAULT;
+let REPOSITORY_URL = REPO_URL_DEFAULT;
+
+function sanitizeUrl(rawUrl, allowedHosts) {
+    try {
+        const u = new URL(rawUrl);
+        if (u.protocol !== 'https:') return null;
+        if (!allowedHosts.has(u.hostname)) return null;
+        return u.origin;
+    } catch {
+        return null;
+    }
+}
+
 (async () => {
     try {
         const { customApiUrl, customRepositoryUrl } = await chrome.storage.local.get(['customApiUrl', 'customRepositoryUrl']);
-        if (customApiUrl) { API_URL = customApiUrl; console.log('🔧 Custom API URL:', customApiUrl); }
-        if (customRepositoryUrl) { REPOSITORY_URL = customRepositoryUrl; console.log('🔧 Custom Repository URL:', customRepositoryUrl); }
+        const safeApi = customApiUrl ? sanitizeUrl(customApiUrl, ALLOWED_API_HOSTS) : null;
+        const safeRepo = customRepositoryUrl ? sanitizeUrl(customRepositoryUrl, ALLOWED_REPO_HOSTS) : null;
+        if (safeApi) { API_URL = safeApi; console.log('🔧 Custom API URL:', safeApi); }
+        if (safeRepo) { REPOSITORY_URL = safeRepo; console.log('🔧 Custom Repository URL:', safeRepo); }
     } catch (e) { /* storage not available */ }
 })();
+
+// ===========================================================================
+// FETCH WITH TIMEOUT + BASIC VALIDATION
+// ===========================================================================
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_TIMEOUT_MS) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new Error('TIMEOUT')), timeoutMs);
+    try {
+        return await fetch(url, { ...options, signal: controller.signal });
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+async function safeJson(response) {
+    try {
+        return await response.json();
+    } catch (e) {
+        throw new Error(`Invalid JSON response (${response.status}): ${e?.message || e}`);
+    }
+}
 
 // ===========================================================================
 // SIDEBAR MANAGEMENT
@@ -34,7 +80,7 @@ chrome.action.onClicked.addListener(async (tab) => {
         await chrome.sidePanel.open({ tabId: tab.id });
     } catch (error) {
         console.error('❌ Failed to open sidebar:', error);
-        try { await chrome.sidePanel.open({ windowId: tab.windowId }); } catch (e) { /* ignore */ }
+        try { await chrome.sidePanel.open({ windowId: tab.windowId }); } catch { /* ignore */ }
     }
 });
 
@@ -51,6 +97,16 @@ chrome.runtime.onInstalled.addListener(() => {
     chrome.contextMenus.create({ id: 'add-link-to-queue', title: 'Diesen Link', parentId: 'add-to-queue', contexts: ['link'] });
 });
 
+function isAllowedUrl(rawUrl) {
+    if (!rawUrl || typeof rawUrl !== 'string') return false;
+    try {
+        const u = new URL(rawUrl);
+        return u.protocol === 'https:' || u.protocol === 'http:';
+    } catch {
+        return false;
+    }
+}
+
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     let url = '';
     let title = '';
@@ -58,7 +114,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     if (info.menuItemId === 'add-page-to-queue') { url = tab.url; title = tab.title || tab.url; }
     else if (info.menuItemId === 'add-link-to-queue') { url = info.linkUrl; title = info.linkUrl; }
 
-    if (!url || url.startsWith('chrome://') || url.startsWith('chrome-extension://')) return;
+    if (!isAllowedUrl(url)) return;
 
     try {
         const { queue = [] } = await chrome.storage.local.get('queue');
@@ -69,16 +125,16 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 
         let pageData = { url, title, html: '', text: '', metadata: {} };
         try {
-            const extracted = await chrome.tabs.sendMessage(tab.id, { action: 'extractPageData' });
+            const extracted = await extractPageDataFromTab(tab.id);
             if (extracted) pageData = extracted;
-        } catch (e) { /* content script not loaded */ }
+        } catch (e) { /* extraction optional */ }
 
         queue.push({
             id: generateId(),
             url: pageData.url || url,
             title: pageData.title || title,
             timestamp: Date.now(),
-            favicon: tab.favIconUrl || '',
+            favicon: sanitizeFaviconUrl(tab.favIconUrl),
             metadata: pageData,
             extractedContent: { html: pageData.html || '', text: pageData.formattedText || pageData.mainContent || pageData.text || '' }
         });
@@ -90,11 +146,41 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
         chrome.action.setBadgeBackgroundColor({ color: '#003B7C' });
         chrome.notifications.create({ type: 'basic', iconUrl: 'icons/128.png', title: 'Zur Merkliste hinzugefügt', message: title });
 
-        try { if (chrome.sidePanel?.open) await chrome.sidePanel.open({ windowId: tab.windowId }); } catch (e) { /* ignore */ }
+        try { if (chrome.sidePanel?.open) await chrome.sidePanel.open({ windowId: tab.windowId }); } catch { /* ignore */ }
     } catch (error) {
         console.error('❌ Failed to add to queue:', error);
     }
 });
+
+function sanitizeFaviconUrl(rawUrl) {
+    if (!rawUrl || typeof rawUrl !== 'string') return '';
+    try {
+        const u = new URL(rawUrl);
+        if (u.protocol === 'https:' || u.protocol === 'http:') return u.href;
+        return '';
+    } catch {
+        return '';
+    }
+}
+
+// ===========================================================================
+// ON-DEMAND CONTENT SCRIPT INJECTION
+// ===========================================================================
+
+async function extractPageDataFromTab(tabId) {
+    if (typeof tabId !== 'number') throw new Error('NO_TAB_ID');
+    try {
+        const results = await chrome.scripting.executeScript({
+            target: { tabId },
+            files: ['content/content.js']
+        });
+        const result = results?.[0]?.result;
+        if (!result || typeof result !== 'object') throw new Error('EMPTY_EXTRACTION');
+        return result;
+    } catch (e) {
+        throw new Error(e?.message || 'EXTRACTION_FAILED');
+    }
+}
 
 // ===========================================================================
 // METADATA HELPERS (flat format from FastAPI)
@@ -106,7 +192,6 @@ function ensureArray(value, defaultValue = []) {
     return [value];
 }
 
-// Flatten complex objects to simple values (aligned with API _flatten_value)
 function flattenValue(item) {
     if (item === null || item === undefined) return null;
     if (typeof item === 'string' || typeof item === 'number' || typeof item === 'boolean') return item;
@@ -135,10 +220,8 @@ function getSingleValue(metadata, key) {
     return val;
 }
 
-// Fields that are set during node creation (not in metadata update)
 const ESSENTIAL_FIELDS = ['cclom:title', 'cclom:general_description', 'cclom:general_keyword', 'ccm:wwwurl', 'cclom:general_language'];
 
-// Internal/meta keys to skip (aligned with API _normalize_for_repo)
 function isInternalKey(key) {
     if (key.startsWith('_')) return true;
     if (['contextName', 'schemaVersion', 'metadataset', 'language', 'exportedAt', 'processing'].includes(key)) return true;
@@ -153,14 +236,11 @@ function buildAdditionalMetadata(metadata, repoFieldIds = null) {
         if (isInternalKey(key)) continue;
         if (ESSENTIAL_FIELDS.includes(key)) continue;
         if (key === 'ccm:linktype') continue;
-
-        // If repo_field IDs provided, only include whitelisted fields (aligned with API)
         if (repoFieldIds && !repoFieldIds.has(key)) continue;
 
         const fieldValue = getFieldValue(metadata, key);
         if (fieldValue === null || fieldValue === undefined) continue;
 
-        // Normalize to array and flatten complex objects (aligned with API _normalize_for_repo)
         const arr = ensureArray(fieldValue);
         const flattened = [];
         for (const item of arr) {
@@ -168,24 +248,16 @@ function buildAdditionalMetadata(metadata, repoFieldIds = null) {
             const flat = flattenValue(item);
             if (flat !== null && flat !== undefined) flattened.push(flat);
         }
-        if (flattened.length > 0) {
-            result[key] = flattened;
-        }
+        if (flattened.length > 0) result[key] = flattened;
     }
 
-    // Handle license transform
     applyLicenseTransform(result, metadata);
-
-    // Transform cm:author → ccm:lifecyclecontributer_author (VCARD format)
     transformAuthorToVcard(result);
-
-    // Extract geo coordinates from schema:location / schema:geo
     extractGeoCoordinates(result, metadata);
 
     return result;
 }
 
-// Valid edu-sharing license keys
 const VALID_LICENSE_KEYS = new Set([
     'NONE', 'CC_0', 'CC0', 'CC_BY', 'CC BY', 'CC_BY_SA', 'CC BY-SA',
     'CC_BY_ND', 'CC BY-ND', 'CC_BY_NC', 'CC BY-NC',
@@ -197,7 +269,6 @@ const VALID_LICENSE_KEYS = new Set([
 function applyLicenseTransform(result, originalMetadata) {
     const customLicense = getSingleValue(originalMetadata, 'ccm:custom_license');
     if (customLicense && typeof customLicense === 'string') {
-        // Only transform if it looks like a URI (contains '/')
         if (customLicense.includes('/')) {
             const token = customLicense.substring(customLicense.lastIndexOf('/') + 1);
             if (token) {
@@ -210,17 +281,12 @@ function applyLicenseTransform(result, originalMetadata) {
                     result['ccm:commonlicense_key'] = [token];
                 }
             }
-            // Remove the URI (it was transformed)
             delete result['ccm:custom_license'];
-        } else {
-            // Plain text → keep as custom license, set key to CUSTOM
-            if (!result['ccm:commonlicense_key']) {
-                result['ccm:commonlicense_key'] = ['CUSTOM'];
-            }
+        } else if (!result['ccm:commonlicense_key']) {
+            result['ccm:commonlicense_key'] = ['CUSTOM'];
         }
     }
 
-    // Validate ccm:commonlicense_key against known keys
     if (result['ccm:commonlicense_key']?.length) {
         const key = String(result['ccm:commonlicense_key'][0]).trim();
         if (!VALID_LICENSE_KEYS.has(key)) {
@@ -230,26 +296,18 @@ function applyLicenseTransform(result, originalMetadata) {
         }
     }
 
-    // Default CC version only for CC-type licenses
     if (result['ccm:commonlicense_key']?.length && !result['ccm:commonlicense_cc_version']) {
         const key = String(result['ccm:commonlicense_key'][0]);
-        if (key.startsWith('CC')) {
-            result['ccm:commonlicense_cc_version'] = ['4.0'];
-        }
+        if (key.startsWith('CC')) result['ccm:commonlicense_cc_version'] = ['4.0'];
     }
 
-    // Default license: COPYRIGHT_FREE if no license was set
     if (!result['ccm:commonlicense_key']) {
         result['ccm:commonlicense_key'] = ['COPYRIGHT_FREE'];
-        console.log('📜 Default license: COPYRIGHT_FREE (no license detected)');
+        console.log('📜 Default license: COPYRIGHT_FREE');
     }
 
     return result;
 }
-
-// ===========================================================================
-// VCARD AUTHOR TRANSFORM
-// ===========================================================================
 
 function transformAuthorToVcard(result) {
     const authors = result['cm:author'];
@@ -274,16 +332,10 @@ function transformAuthorToVcard(result) {
     if (vcards.length > 0) {
         delete result['cm:author'];
         result['ccm:lifecyclecontributer_author'] = vcards;
-        console.log(`👤 Author VCARD: ${vcards.length} entries`);
     }
 }
 
-// ===========================================================================
-// GEO COORDINATE EXTRACTION
-// ===========================================================================
-
 function extractGeoCoordinates(result, metadata) {
-    // Source 1: schema:location[].geo.latitude/longitude
     const locations = metadata['schema:location'];
     if (Array.isArray(locations)) {
         for (const loc of locations) {
@@ -293,14 +345,12 @@ function extractGeoCoordinates(result, metadata) {
                 if (lat != null && lon != null) {
                     result['cm:latitude'] = [String(lat)];
                     result['cm:longitude'] = [String(lon)];
-                    console.log(`📍 Geo (location): ${lat}, ${lon}`);
                     return;
                 }
             }
         }
     }
 
-    // Source 2: schema:geo (organization top-level)
     const geo = metadata['schema:geo'];
     if (geo && typeof geo === 'object') {
         const lat = geo.latitude;
@@ -308,54 +358,44 @@ function extractGeoCoordinates(result, metadata) {
         if (lat != null && lon != null) {
             result['cm:latitude'] = [String(lat)];
             result['cm:longitude'] = [String(lon)];
-            console.log(`📍 Geo (top-level): ${lat}, ${lon}`);
         }
     }
 }
 
 // ===========================================================================
-// FETCH REPO FIELD IDS FROM API (aligned with API get_repo_fields)
+// FETCH REPO FIELD IDS FROM API (validated)
 // ===========================================================================
 
+const FIELD_ID_PATTERN = /^[a-z][a-z0-9:_-]*$/i;
+
 async function fetchRepoFieldIds(metadata) {
-    const context = metadata.contextName || 'default';
-    const version = metadata.schemaVersion || 'latest';
-    const schemaFile = metadata.metadataset || null;
+    const context = typeof metadata.contextName === 'string' ? metadata.contextName : 'default';
+    const version = typeof metadata.schemaVersion === 'string' ? metadata.schemaVersion : 'latest';
+    const schemaFile = typeof metadata.metadataset === 'string' ? metadata.metadataset : null;
 
     const fieldIds = new Set();
 
-    // Always load core.json fields
-    try {
-        const coreResp = await fetch(`${API_URL}/info/schema/${context}/${version}/core.json`);
-        if (coreResp.ok) {
-            const coreSchema = await coreResp.json();
-            for (const field of (coreSchema.fields || [])) {
-                if (field.system?.repo_field) {
-                    const id = field.system?.path || field.id;
-                    if (id) fieldIds.add(id);
-                }
-            }
-        }
-    } catch (e) {
-        console.warn('⚠️ Failed to load core.json repo fields:', e);
-    }
-
-    // Load special schema fields (e.g. event.json)
-    if (schemaFile) {
+    async function loadSchema(path) {
         try {
-            const schemaResp = await fetch(`${API_URL}/info/schema/${context}/${version}/${schemaFile}`);
-            if (schemaResp.ok) {
-                const schema = await schemaResp.json();
-                for (const field of (schema.fields || [])) {
-                    if (field.system?.repo_field) {
-                        const id = field.system?.path || field.id;
-                        if (id) fieldIds.add(id);
-                    }
-                }
+            const resp = await fetchWithTimeout(`${API_URL}${path}`, {}, DEFAULT_TIMEOUT_MS);
+            if (!resp.ok) return;
+            const schema = await safeJson(resp);
+            if (!schema || !Array.isArray(schema.fields)) return;
+            for (const field of schema.fields) {
+                if (!field || typeof field !== 'object') continue;
+                if (field.system?.repo_field !== true) continue;
+                const id = field.system?.path || field.id;
+                if (typeof id !== 'string' || !FIELD_ID_PATTERN.test(id)) continue;
+                fieldIds.add(id);
             }
         } catch (e) {
-            console.warn(`⚠️ Failed to load ${schemaFile} repo fields:`, e);
+            console.warn(`⚠️ Failed to load schema ${path}:`, e?.message || e);
         }
+    }
+
+    await loadSchema(`/info/schema/${encodeURIComponent(context)}/${encodeURIComponent(version)}/core.json`);
+    if (schemaFile && /^[a-z0-9._-]+$/i.test(schemaFile)) {
+        await loadSchema(`/info/schema/${encodeURIComponent(context)}/${encodeURIComponent(version)}/${schemaFile}`);
     }
 
     console.log(`📋 Repo fields from schema: ${fieldIds.size} fields`);
@@ -363,27 +403,22 @@ async function fetchRepoFieldIds(metadata) {
 }
 
 // ===========================================================================
-// SET METADATA WITH FIELD-BY-FIELD FALLBACK (aligned with API _set_metadata)
+// SET METADATA WITH FIELD-BY-FIELD FALLBACK
 // ===========================================================================
 
 async function setMetadataWithFallback(nodeId, metadataToSet, authHeader) {
     const metadataUrl = `${REPOSITORY_URL}/edu-sharing/rest/node/v1/nodes/-home-/${nodeId}/metadata?versionComment=METADATA_UPDATE&obeyMds=false`;
     const fieldCount = Object.keys(metadataToSet).length;
 
-    // Strategy 1: Bulk update
-    const bulkResp = await fetch(metadataUrl, {
+    const bulkResp = await fetchWithTimeout(metadataUrl, {
         method: 'POST',
         headers: { 'Authorization': authHeader, 'Content-Type': 'application/json', 'Accept': 'application/json' },
         credentials: 'include',
         body: JSON.stringify(metadataToSet)
-    });
+    }, UPLOAD_TIMEOUT_MS);
 
-    if (bulkResp.ok) {
-        console.log(`✅ Bulk metadata update succeeded: ${fieldCount} fields`);
-        return { success: true, fields_written: fieldCount, fields_skipped: 0, field_errors: [] };
-    }
+    if (bulkResp.ok) return { success: true, fields_written: fieldCount, fields_skipped: 0, field_errors: [] };
 
-    // Strategy 2: Field-by-field fallback
     console.warn(`⚠️ Bulk metadata update failed (${bulkResp.status}), retrying field-by-field...`);
     let fieldsWritten = 0;
     let fieldsSkipped = 0;
@@ -391,39 +426,35 @@ async function setMetadataWithFallback(nodeId, metadataToSet, authHeader) {
 
     for (const [fieldId, fieldValue] of Object.entries(metadataToSet)) {
         try {
-            const singleResp = await fetch(metadataUrl, {
+            const singleResp = await fetchWithTimeout(metadataUrl, {
                 method: 'POST',
                 headers: { 'Authorization': authHeader, 'Content-Type': 'application/json', 'Accept': 'application/json' },
                 credentials: 'include',
                 body: JSON.stringify({ [fieldId]: fieldValue })
-            });
+            }, UPLOAD_TIMEOUT_MS);
 
             if (singleResp.ok) {
                 fieldsWritten++;
             } else {
                 fieldsSkipped++;
-                const errText = (await singleResp.text()).substring(0, 200);
+                const errText = (await singleResp.text().catch(() => '')).substring(0, 200);
                 fieldErrors.push({ field_id: fieldId, error: `HTTP ${singleResp.status}: ${errText}` });
-                console.log(`   ❌ ${fieldId}: ${singleResp.status}`);
             }
         } catch (e) {
             fieldsSkipped++;
-            fieldErrors.push({ field_id: fieldId, error: String(e) });
-            console.log(`   ❌ ${fieldId}: ${e}`);
+            fieldErrors.push({ field_id: fieldId, error: String(e?.message || e) });
         }
     }
 
-    console.log(`📊 Field-by-field result: ${fieldsWritten} written, ${fieldsSkipped} failed`);
     return { success: fieldsWritten > 0, fields_written: fieldsWritten, fields_skipped: fieldsSkipped, field_errors: fieldErrors };
 }
 
 // ===========================================================================
-// COLLECTION SUPPORT (aligned with API _set_collections)
+// COLLECTIONS
 // ===========================================================================
 
 function extractCollectionIds(metadata) {
     const ids = [];
-
     const primary = metadata['virtual:collection_id_primary'];
     if (primary) ids.push(extractIdFromUrl(primary));
 
@@ -431,8 +462,7 @@ function extractCollectionIds(metadata) {
     if (Array.isArray(additional)) {
         for (const coll of additional) ids.push(extractIdFromUrl(coll));
     }
-
-    return ids.filter(Boolean);
+    return ids.filter(id => typeof id === 'string' && /^[a-z0-9-]+$/i.test(id));
 }
 
 function extractIdFromUrl(value) {
@@ -443,7 +473,7 @@ function extractIdFromUrl(value) {
 async function setCollections(nodeId, collectionIds, authHeader) {
     for (const collectionId of collectionIds) {
         try {
-            const resp = await fetch(
+            const resp = await fetchWithTimeout(
                 `${REPOSITORY_URL}/edu-sharing/rest/collection/v1/collections/-home-/${collectionId}/references/${nodeId}`,
                 {
                     method: 'PUT',
@@ -451,21 +481,20 @@ async function setCollections(nodeId, collectionIds, authHeader) {
                     credentials: 'include'
                 }
             );
-            if (resp.ok) console.log(`📂 Added to collection: ${collectionId}`);
-            else console.warn(`⚠️ Collection ${collectionId} failed: ${resp.status}`);
+            if (!resp.ok) console.warn(`⚠️ Collection ${collectionId} failed: ${resp.status}`);
         } catch (e) {
-            console.warn(`⚠️ Collection ${collectionId} error:`, e);
+            console.warn(`⚠️ Collection ${collectionId} error:`, e?.message || e);
         }
     }
 }
 
 // ===========================================================================
-// START REVIEW WORKFLOW (aligned with API _start_workflow)
+// REVIEW WORKFLOW
 // ===========================================================================
 
 async function startWorkflow(nodeId, authHeader) {
     try {
-        const resp = await fetch(
+        const resp = await fetchWithTimeout(
             `${REPOSITORY_URL}/edu-sharing/rest/node/v1/nodes/-home-/${nodeId}/workflow`,
             {
                 method: 'PUT',
@@ -479,15 +508,14 @@ async function startWorkflow(nodeId, authHeader) {
                 })
             }
         );
-        if (resp.ok) console.log('🚀 Workflow started');
-        else console.warn(`⚠️ Workflow failed: ${resp.status}`);
+        if (!resp.ok) console.warn(`⚠️ Workflow failed: ${resp.status}`);
     } catch (e) {
-        console.warn('⚠️ Workflow error:', e);
+        console.warn('⚠️ Workflow error:', e?.message || e);
     }
 }
 
 // ===========================================================================
-// EXTENDED TYPE → NEW_LRT MAPPING
+// EXTENDED TYPE MAPPING
 // ===========================================================================
 
 const EXTENDED_TYPE_TO_NEW_LRT = {
@@ -499,96 +527,63 @@ const EXTENDED_TYPE_TO_NEW_LRT = {
     'http://w3id.org/openeduhub/vocabs/contentTypes/learning_material': 'http://w3id.org/openeduhub/vocabs/new_lrt/1846d876-d8fd-476a-b540-b8ffd713fedb',
 };
 
-// ===========================================================================
-// WRITE EXTENDED FIELDS (ccm:oeh_extendedType, ccm:oeh_extendedData, ccm:oeh_extendedText)
-// ===========================================================================
-
 async function writeExtendedFields(nodeId, metadata, authHeader) {
     try {
         const extendedFields = {};
-
-        // 1. ccm:oeh_extendedType — resolve URI from metadataset_uri (set by web component export)
         const typeUri = metadata?.metadataset_uri;
-        if (typeUri) {
-            extendedFields['ccm:oeh_extendedType'] = [typeUri];
-        }
-
-        // 1b. ccm:oeh_lrt — map extended type to learning resource type
+        if (typeUri) extendedFields['ccm:oeh_extendedType'] = [typeUri];
         if (typeUri && EXTENDED_TYPE_TO_NEW_LRT[typeUri]) {
-            const lrtUri = EXTENDED_TYPE_TO_NEW_LRT[typeUri];
-            extendedFields['ccm:oeh_lrt'] = [lrtUri];
-            console.log(`📎 new_lrt: ${lrtUri} (from extendedType ${typeUri.split('/').pop()})`);
+            extendedFields['ccm:oeh_lrt'] = [EXTENDED_TYPE_TO_NEW_LRT[typeUri]];
         }
 
-        // 2. ccm:oeh_extendedData — full metadata as JSON string
         const excludedKeys = new Set(['contextName', 'schemaVersion', 'metadataset', 'metadataset_uri', 'language', 'exportedAt', 'processing', '_origins', '_source_text', 'preview_image_url']);
         const dataDict = {};
         for (const [k, v] of Object.entries(metadata)) {
-            if (!excludedKeys.has(k) && v !== null && v !== undefined && v !== '') {
-                dataDict[k] = v;
-            }
+            if (!excludedKeys.has(k) && v !== null && v !== undefined && v !== '') dataDict[k] = v;
         }
-        if (Object.keys(dataDict).length > 0) {
-            extendedFields['ccm:oeh_extendedData'] = [JSON.stringify(dataDict)];
-        }
+        if (Object.keys(dataDict).length > 0) extendedFields['ccm:oeh_extendedData'] = [JSON.stringify(dataDict)];
 
-        // 3. ccm:oeh_extendedText — raw source text before extraction
         const sourceText = metadata?._source_text;
-        if (sourceText) {
-            extendedFields['ccm:oeh_extendedText'] = [sourceText];
-        }
+        if (sourceText) extendedFields['ccm:oeh_extendedText'] = [sourceText];
 
-        if (Object.keys(extendedFields).length === 0) {
-            console.log('⚠️ No extended fields to write');
-            return;
-        }
+        if (Object.keys(extendedFields).length === 0) return;
 
-        const resp = await fetch(
-            `${REPOSITORY_URL}/edu-sharing/rest/node/v1/nodes/-home-/${nodeId}/metadata?versionComment=EXTENDED_DATA&obeyMds=false`,
-            {
-                method: 'POST',
-                headers: { 'Authorization': authHeader, 'Content-Type': 'application/json', 'Accept': 'application/json' },
-                credentials: 'include',
-                body: JSON.stringify(extendedFields)
-            }
-        );
+        const endpoint = `${REPOSITORY_URL}/edu-sharing/rest/node/v1/nodes/-home-/${nodeId}/metadata?versionComment=EXTENDED_DATA&obeyMds=false`;
 
-        if (resp.ok || resp.status === 200 || resp.status === 201) {
-            console.log(`✅ Extended fields written: ${Object.keys(extendedFields).join(', ')}`);
-        } else {
-            console.warn(`⚠️ Extended fields write failed: ${resp.status}`);
-            // Fallback: write field-by-field
-            for (const [fieldId, fieldValue] of Object.entries(extendedFields)) {
-                try {
-                    const singleResp = await fetch(
-                        `${REPOSITORY_URL}/edu-sharing/rest/node/v1/nodes/-home-/${nodeId}/metadata?versionComment=EXTENDED_DATA&obeyMds=false`,
-                        {
-                            method: 'POST',
-                            headers: { 'Authorization': authHeader, 'Content-Type': 'application/json', 'Accept': 'application/json' },
-                            credentials: 'include',
-                            body: JSON.stringify({ [fieldId]: fieldValue })
-                        }
-                    );
-                    if (singleResp.ok) console.log(`   ✅ ${fieldId}`);
-                    else console.warn(`   ❌ ${fieldId}: ${singleResp.status}`);
-                } catch (e) {
-                    console.warn(`   ❌ ${fieldId}: ${e.message}`);
-                }
+        const resp = await fetchWithTimeout(endpoint, {
+            method: 'POST',
+            headers: { 'Authorization': authHeader, 'Content-Type': 'application/json', 'Accept': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify(extendedFields)
+        }, UPLOAD_TIMEOUT_MS);
+
+        if (resp.ok) return;
+
+        console.warn(`⚠️ Extended fields write failed: ${resp.status}`);
+        for (const [fieldId, fieldValue] of Object.entries(extendedFields)) {
+            try {
+                await fetchWithTimeout(endpoint, {
+                    method: 'POST',
+                    headers: { 'Authorization': authHeader, 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                    credentials: 'include',
+                    body: JSON.stringify({ [fieldId]: fieldValue })
+                }, UPLOAD_TIMEOUT_MS);
+            } catch (e) {
+                console.warn(`   ❌ ${fieldId}: ${e?.message || e}`);
             }
         }
     } catch (e) {
-        console.warn('⚠️ Extended fields error:', e);
+        console.warn('⚠️ Extended fields error:', e?.message || e);
     }
 }
 
 // ===========================================================================
-// ENSURE ASPECTS
+// ASPECTS
 // ===========================================================================
 
 async function ensureAspects(nodeId, metadata, authHeader) {
     const extraAspects = [];
 
-    // cm:geographic for geo fields
     let hasGeo = false;
     const locations = metadata['schema:location'];
     if (Array.isArray(locations)) {
@@ -600,7 +595,6 @@ async function ensureAspects(nodeId, metadata, authHeader) {
     }
     if (hasGeo) extraAspects.push('cm:geographic');
 
-    // cm:author for VCARD
     if (metadata['cm:author'] && (Array.isArray(metadata['cm:author']) ? metadata['cm:author'].length > 0 : true)) {
         extraAspects.push('cm:author');
     }
@@ -608,22 +602,21 @@ async function ensureAspects(nodeId, metadata, authHeader) {
     if (extraAspects.length === 0) return;
 
     try {
-        // Read current aspects
-        const metaResp = await fetch(
+        const metaResp = await fetchWithTimeout(
             `${REPOSITORY_URL}/edu-sharing/rest/node/v1/nodes/-home-/${nodeId}/metadata?propertyFilter=-all-`,
             { headers: { 'Authorization': authHeader, 'Accept': 'application/json' }, credentials: 'include' }
         );
         let currentAspects = [];
         if (metaResp.ok) {
-            const data = await metaResp.json();
-            currentAspects = data.node?.aspects || [];
+            const data = await safeJson(metaResp).catch(() => ({}));
+            if (Array.isArray(data?.node?.aspects)) currentAspects = data.node.aspects;
         }
 
         const newAspects = extraAspects.filter(a => !currentAspects.includes(a));
         if (newAspects.length === 0) return;
 
         const fullList = [...currentAspects, ...newAspects];
-        const resp = await fetch(
+        await fetchWithTimeout(
             `${REPOSITORY_URL}/edu-sharing/rest/node/v1/nodes/-home-/${nodeId}/aspects`,
             {
                 method: 'PUT',
@@ -632,10 +625,8 @@ async function ensureAspects(nodeId, metadata, authHeader) {
                 body: JSON.stringify(fullList)
             }
         );
-        if (resp.ok) console.log(`🔧 Aspects added: ${newAspects.join(', ')}`);
-        else console.warn(`⚠️ Aspects failed: ${resp.status}`);
     } catch (e) {
-        console.warn('⚠️ Aspect update error:', e);
+        console.warn('⚠️ Aspect update error:', e?.message || e);
     }
 }
 
@@ -645,7 +636,7 @@ async function ensureAspects(nodeId, metadata, authHeader) {
 
 async function checkDuplicate(url, authHeader) {
     try {
-        const searchResponse = await fetch(
+        const searchResponse = await fetchWithTimeout(
             `${REPOSITORY_URL}/edu-sharing/rest/search/v1/queries/-home-/mds_oeh/ngsearch?contentType=FILES&maxItems=10&skipCount=0&propertyFilter=ccm:wwwurl`,
             {
                 method: 'POST',
@@ -656,25 +647,29 @@ async function checkDuplicate(url, authHeader) {
         );
 
         if (!searchResponse.ok) return null;
-        const searchData = await searchResponse.json();
+        const searchData = await safeJson(searchResponse).catch(() => null);
+        if (!searchData || !Array.isArray(searchData.nodes)) return null;
 
-        if (searchData.nodes && searchData.nodes.length > 0) {
-            for (const node of searchData.nodes) {
-                const nodeUrl = node.properties?.['ccm:wwwurl']?.[0];
-                if (nodeUrl && nodeUrl.toLowerCase() === url.toLowerCase()) {
-                    return { id: node.ref.id, title: node.title, url: nodeUrl };
-                }
+        for (const node of searchData.nodes) {
+            if (!node || typeof node !== 'object') continue;
+            const nodeUrl = node.properties?.['ccm:wwwurl']?.[0];
+            const nodeId = node.ref?.id;
+            const title = typeof node.title === 'string' ? node.title : '';
+            if (typeof nodeId !== 'string' || !nodeId) continue;
+            if (typeof nodeUrl !== 'string' || !nodeUrl) continue;
+            if (nodeUrl.toLowerCase() === url.toLowerCase()) {
+                return { id: nodeId, title, url: nodeUrl };
             }
         }
         return null;
     } catch (error) {
-        console.error('❌ Duplicate check error:', error);
+        console.error('❌ Duplicate check error:', error?.message || error);
         return null;
     }
 }
 
 // ===========================================================================
-// UPLOAD: USER MODE (aligned with API: repo_field filtering, fallback, collections)
+// UPLOAD: USER MODE
 // ===========================================================================
 
 async function uploadAsUser(metadata, session) {
@@ -682,21 +677,19 @@ async function uploadAsUser(metadata, session) {
 
     const authHeader = session.authHeader;
     const userHomeId = session.userHomeId;
+    if (!authHeader) throw new Error('SESSION_EXPIRED');
     if (!userHomeId) throw new Error('User Home ID nicht gefunden');
 
     const url = getSingleValue(metadata, 'ccm:wwwurl');
     if (!url) throw new Error('URL fehlt in Metadaten');
 
-    // 0. Fetch repo_field IDs from API schema (aligned with API get_repo_fields)
     const repoFieldIds = await fetchRepoFieldIds(metadata);
 
-    // 1. Duplicate check
     const existingNode = await checkDuplicate(url, authHeader);
     if (existingNode) {
         return { success: false, error: 'duplicate', message: 'URL bereits im Repository.', existingNode };
     }
 
-    // 2. Create node (5 essential fields only, aligned with API)
     const titleArray = ensureArray(getFieldValue(metadata, 'cclom:title'), ['Untitled']);
     const createPayload = {
         'ccm:wwwurl': ensureArray(url),
@@ -710,45 +703,38 @@ async function uploadAsUser(metadata, session) {
     const langArray = ensureArray(getFieldValue(metadata, 'cclom:general_language'), ['de']);
     if (langArray.length > 0) createPayload['cclom:general_language'] = langArray;
 
-    const createResponse = await fetch(
+    const createResponse = await fetchWithTimeout(
         `${REPOSITORY_URL}/edu-sharing/rest/node/v1/nodes/-home-/${userHomeId}/children?type=ccm:io&renameIfExists=true&versionComment=MAIN_FILE_UPLOAD`,
         {
             method: 'POST',
             headers: { 'Authorization': authHeader, 'Content-Type': 'application/json', 'Accept': 'application/json' },
             credentials: 'include',
             body: JSON.stringify(createPayload)
-        }
+        },
+        UPLOAD_TIMEOUT_MS
     );
 
     if (!createResponse.ok) {
-        const errorText = await createResponse.text();
-        throw new Error(`Create node failed: ${createResponse.status} - ${errorText.substring(0, 200)}`);
+        const errorText = (await createResponse.text().catch(() => '')).substring(0, 200);
+        throw new Error(`Create node failed: ${createResponse.status} - ${errorText}`);
     }
 
-    const createData = await createResponse.json();
-    const nodeId = createData.node.ref.id;
-    console.log('✅ Node created:', nodeId);
+    const createData = await safeJson(createResponse);
+    const nodeId = createData?.node?.ref?.id;
+    if (typeof nodeId !== 'string' || !nodeId) throw new Error('Invalid create response: no node id');
 
-    // 3. Ensure aspects for special fields
     await ensureAspects(nodeId, metadata, authHeader);
 
-    // 4. Set metadata with repo_field filtering + field-by-field fallback
     const metadataToSet = buildAdditionalMetadata(metadata, repoFieldIds);
     let metaResult = { fields_written: 0, fields_skipped: 0, field_errors: [] };
     if (Object.keys(metadataToSet).length > 0) {
         metaResult = await setMetadataWithFallback(nodeId, metadataToSet, authHeader);
     }
 
-    // 5. Set collections if present
     const collectionIds = extractCollectionIds(metadata);
-    if (collectionIds.length > 0) {
-        await setCollections(nodeId, collectionIds, authHeader);
-    }
+    if (collectionIds.length > 0) await setCollections(nodeId, collectionIds, authHeader);
 
-    // 6. Write extended data fields (ccm:oeh_extendedType, ccm:oeh_extendedData, ccm:oeh_extendedText)
     await writeExtendedFields(nodeId, metadata, authHeader);
-
-    // 7. Start review workflow (aligned with API)
     await startWorkflow(nodeId, authHeader);
 
     const repoUrl = `${REPOSITORY_URL}/edu-sharing/components/render/${nodeId}`;
@@ -759,7 +745,7 @@ async function uploadAsUser(metadata, session) {
 }
 
 // ===========================================================================
-// UPLOAD: GUEST MODE — Delegate to API /upload (ensures identical logic)
+// UPLOAD: GUEST MODE — delegated to API /upload (server-side credentials)
 // ===========================================================================
 
 async function uploadAsGuest(metadata, previewUrl) {
@@ -768,13 +754,10 @@ async function uploadAsGuest(metadata, previewUrl) {
     const url = getSingleValue(metadata, 'ccm:wwwurl');
     if (!url) throw new Error('URL fehlt in Metadaten');
 
-    // Extract _source_text from metadata (added by web component export) for extended data
     const sourceText = metadata?._source_text || undefined;
 
-    // Delegate entire upload to API — ensures identical processing
-    // (repo_field filtering, transforms, field-by-field fallback, workflow)
     const uploadBody = {
-        metadata: metadata,
+        metadata,
         repository: 'staging',
         check_duplicates: true,
         start_workflow: true,
@@ -782,48 +765,45 @@ async function uploadAsGuest(metadata, previewUrl) {
         extended_text: sourceText
     };
 
-    // Pass preview URL for server-side screenshot capture (guest has no direct repo access)
-    if (previewUrl) {
+    if (typeof previewUrl === 'string' && /^https?:\/\//.test(previewUrl)) {
         uploadBody.preview_url = previewUrl;
         uploadBody.screenshot_method = 'pageshot';
-        console.log('📸 Guest mode: passing preview_url to API for screenshot:', previewUrl);
     }
 
-    const response = await fetch(`${API_URL}/upload`, {
+    const response = await fetchWithTimeout(`${API_URL}/upload`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
         body: JSON.stringify(uploadBody)
-    });
+    }, UPLOAD_TIMEOUT_MS);
 
     if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`API upload failed: ${response.status} - ${errorText.substring(0, 300)}`);
+        const errorText = (await response.text().catch(() => '')).substring(0, 300);
+        throw new Error(`API upload failed: ${response.status} - ${errorText}`);
     }
 
-    const result = await response.json();
-    console.log('📡 API /upload response:', result);
+    const result = await safeJson(response);
+    if (!result || typeof result !== 'object') throw new Error('Upload: invalid API response');
 
-    // Map API response to plugin format
     if (result.duplicate) {
         return {
             success: false,
             error: 'duplicate',
-            message: result.error || 'URL bereits im Repository.',
+            message: (typeof result.error === 'string' ? result.error : null) || 'URL bereits im Repository.',
             existingNode: result.node ? {
-                id: result.node.nodeId,
-                title: result.node.title,
-                url: result.node.wwwurl
+                id: typeof result.node.nodeId === 'string' ? result.node.nodeId : '',
+                title: typeof result.node.title === 'string' ? result.node.title : '',
+                url: typeof result.node.wwwurl === 'string' ? result.node.wwwurl : ''
             } : null
         };
     }
 
-    if (!result.success) {
-        throw new Error(result.error || 'Upload fehlgeschlagen');
-    }
+    if (!result.success) throw new Error(typeof result.error === 'string' ? result.error : 'Upload fehlgeschlagen');
 
-    const nodeId = result.node?.nodeId;
-    const title = result.node?.title || getSingleValue(metadata, 'cclom:title') || 'Untitled';
-    const repoUrl = result.node?.repositoryUrl || (nodeId ? `${REPOSITORY_URL}/edu-sharing/components/render/${nodeId}` : null);
+    const nodeId = typeof result.node?.nodeId === 'string' ? result.node.nodeId : null;
+    const title = (typeof result.node?.title === 'string' && result.node.title) ||
+                  getSingleValue(metadata, 'cclom:title') || 'Untitled';
+    const repoUrl = (typeof result.node?.repositoryUrl === 'string' && result.node.repositoryUrl)
+        || (nodeId ? `${REPOSITORY_URL}/edu-sharing/components/render/${nodeId}` : null);
 
     return {
         success: true, nodeId, mode: 'guest', title, repoUrl, repositoryUrl: repoUrl,
@@ -838,63 +818,50 @@ async function uploadAsGuest(metadata, previewUrl) {
 // ===========================================================================
 
 async function handleSaveMetadata(metadata, previewUrl) {
-    console.log('💾 Starting metadata save...');
     try {
+        if (!metadata || typeof metadata !== 'object') throw new Error('INVALID_METADATA');
         const { wloSession } = await chrome.storage.local.get('wloSession');
-        const isUserMode = wloSession && wloSession.isValidLogin && !wloSession.isGuest;
-        console.log(`📋 Mode: ${isUserMode ? 'User' : 'Guest'}`);
-
+        const isUserMode = wloSession && wloSession.isValidLogin && wloSession.authHeader && !wloSession.isGuest;
         if (isUserMode) return await uploadAsUser(metadata, wloSession);
-        else return await uploadAsGuest(metadata, previewUrl);
+        return await uploadAsGuest(metadata, previewUrl);
     } catch (error) {
-        console.error('❌ Save failed:', error);
+        console.error('❌ Save failed:', error?.message || error);
         throw error;
     }
 }
 
 // ===========================================================================
-// SCREENSHOT: Capture visible tab & upload as preview
+// SCREENSHOT (user mode only)
 // ===========================================================================
 
 async function captureVisibleTab() {
     try {
-        const dataUrl = await chrome.tabs.captureVisibleTab(null, { format: 'png', quality: 90 });
-        console.log('📸 Tab screenshot captured:', Math.round(dataUrl.length / 1024), 'KB');
-        return dataUrl;
+        return await chrome.tabs.captureVisibleTab(null, { format: 'png', quality: 90 });
     } catch (e) {
-        console.warn('⚠️ captureVisibleTab failed:', e);
+        console.warn('⚠️ captureVisibleTab failed:', e?.message || e);
         return null;
     }
 }
 
 async function uploadPreviewImage(nodeId, dataUrl, authHeader) {
-    if (!nodeId || !dataUrl) return false;
+    if (!nodeId || !dataUrl || !authHeader) return false;
     try {
-        // Convert data URL to Blob
         const resp = await fetch(dataUrl);
         const blob = await resp.blob();
-
         const uploadUrl = `${REPOSITORY_URL}/edu-sharing/rest/node/v1/nodes/-home-/${nodeId}/preview?mimetype=image/png&createVersion=true`;
-
         const formData = new FormData();
         formData.append('image', blob, 'screenshot.png');
 
-        const uploadResp = await fetch(uploadUrl, {
+        const uploadResp = await fetchWithTimeout(uploadUrl, {
             method: 'POST',
             headers: { 'Authorization': authHeader },
             credentials: 'include',
             body: formData
-        });
+        }, UPLOAD_TIMEOUT_MS);
 
-        if (uploadResp.ok || uploadResp.status === 200 || uploadResp.status === 204) {
-            console.log('✅ Preview image uploaded to node', nodeId);
-            return true;
-        } else {
-            console.warn('⚠️ Preview upload failed:', uploadResp.status);
-            return false;
-        }
+        return uploadResp.ok;
     } catch (e) {
-        console.warn('⚠️ Preview upload error:', e);
+        console.warn('⚠️ Preview upload error:', e?.message || e);
         return false;
     }
 }
@@ -904,7 +871,7 @@ async function uploadPreviewImage(nodeId, dataUrl, authHeader) {
 // ===========================================================================
 
 function generateId() {
-    return Date.now().toString(36) + Math.random().toString(36).substr(2);
+    return Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
 }
 
 async function getActiveNormalTab() {
@@ -921,51 +888,64 @@ async function getActiveNormalTab() {
 // MESSAGE HANDLERS
 // ===========================================================================
 
+const ALLOWED_ACTIONS = new Set([
+    'saveMetadata', 'warenkorb.addItem', 'warenkorb.prefetchSearch',
+    'tabs.getActive', 'tabs.extractPageData', 'tabs.captureScreenshot', 'tabs.uploadPreview',
+    'queue.get', 'queue.add', 'queue.remove', 'queue.clear', 'queue.search', 'queue.export',
+    'pendingItems.add', 'pendingItems.get', 'pendingItems.clear',
+    'history.get', 'history.add', 'history.stats', 'history.search', 'history.export', 'history.clear',
+    'storage.info'
+]);
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    // Save metadata (async)
+    if (!message || typeof message !== 'object' || typeof message.action !== 'string') {
+        sendResponse({ success: false, error: 'INVALID_MESSAGE' });
+        return false;
+    }
+    if (!ALLOWED_ACTIONS.has(message.action)) {
+        sendResponse({ success: false, error: 'UNKNOWN_ACTION' });
+        return false;
+    }
+
     if (message.action === 'saveMetadata') {
         handleSaveMetadata(message.metadata, message.previewUrl)
             .then(result => sendResponse(result))
-            .catch(error => sendResponse({ success: false, error: error.message }));
+            .catch(error => sendResponse({ success: false, error: error?.message || 'UPLOAD_FAILED' }));
         return true;
     }
 
-    // Warenkorb: addItem is handled directly by sidebar listener
-    // (chrome.runtime.sendMessage from content scripts reaches all extension pages)
     if (message.action === 'warenkorb.addItem') {
-        return false; // Let the sidebar handle it
+        return false; // sidebar handles it
     }
 
-    // Warenkorb: prefetch search results so content script can map card titles → nodeIds
     if (message.action === 'warenkorb.prefetchSearch') {
-        const query = message.query;
+        const query = typeof message.query === 'string' ? message.query.trim() : '';
         if (!query) { sendResponse({ nodes: [] }); return true; }
 
-        const repoUrl = 'https://redaktion.openeduhub.net/edu-sharing/rest';
-        const searchUrl = `${repoUrl}/search/v1/queries/-home-/mds_oeh/ngsearch`
-            + `?contentType=FILES&maxItems=50&skipCount=0&propertyFilter=-all-`;
+        const searchUrl = 'https://redaktion.openeduhub.net/edu-sharing/rest/search/v1/queries/-home-/mds_oeh/ngsearch'
+            + '?contentType=FILES&maxItems=50&skipCount=0&propertyFilter=-all-';
 
-        fetch(searchUrl, {
+        fetchWithTimeout(searchUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
             body: JSON.stringify({ criteria: [{ property: 'ngsearchword', values: [query] }] })
         })
-        .then(r => r.ok ? r.json() : Promise.reject(r.status))
-        .then(data => {
-            const nodes = (data.nodes || []).map(n => ({
-                id: n.ref?.id || '',
-                title: (n.properties?.['cclom:title'] || [])[0] || n.name || '',
-                publisher: (n.properties?.['ccm:oeh_publisher_combined'] || [])[0] || '',
-                wwwurl: (n.properties?.['ccm:wwwurl'] || [])[0] || ''
-            }));
-            console.log('🛒 Prefetch:', nodes.length, 'nodes for query:', query);
-            sendResponse({ nodes });
-        })
-        .catch(err => {
-            console.warn('🛒 Prefetch failed:', err);
-            sendResponse({ nodes: [] });
-        });
-        return true; // keep channel open for async
+            .then(r => r.ok ? safeJson(r) : Promise.reject(new Error(`HTTP ${r.status}`)))
+            .then(data => {
+                const rawNodes = Array.isArray(data?.nodes) ? data.nodes : [];
+                const nodes = rawNodes.map(n => ({
+                    id: typeof n?.ref?.id === 'string' ? n.ref.id : '',
+                    title: (Array.isArray(n?.properties?.['cclom:title']) && n.properties['cclom:title'][0]) || (typeof n?.name === 'string' ? n.name : ''),
+                    publisher: (Array.isArray(n?.properties?.['ccm:oeh_publisher_combined']) && n.properties['ccm:oeh_publisher_combined'][0]) || '',
+                    wwwurl: (Array.isArray(n?.properties?.['ccm:wwwurl']) && n.properties['ccm:wwwurl'][0]) || ''
+                })).filter(n => n.id);
+                sendResponse({ nodes });
+            })
+            .catch(err => {
+                console.warn('🛒 Prefetch failed:', err?.message || err);
+                sendResponse({ nodes: [] });
+            });
+        return true;
     }
 
     const handleAsync = async () => {
@@ -975,18 +955,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                     const tab = await getActiveNormalTab();
                     if (!tab) return { success: false, error: 'NO_ACTIVE_TAB' };
                     const { id, url, title, favIconUrl } = tab;
-                    return { success: true, tab: { id, url, title, favIconUrl } };
+                    return { success: true, tab: { id, url, title, favIconUrl: sanitizeFaviconUrl(favIconUrl) } };
                 }
 
                 case 'tabs.extractPageData': {
-                    let targetTabId = message.tabId;
+                    let targetTabId = typeof message.tabId === 'number' ? message.tabId : null;
                     if (!targetTabId) {
                         const tab = await getActiveNormalTab();
                         if (!tab) return { success: false, error: 'NO_ACTIVE_TAB' };
                         targetTabId = tab.id;
                     }
                     try {
-                        const pageData = await chrome.tabs.sendMessage(targetTabId, { action: 'extractPageData' });
+                        const pageData = await extractPageDataFromTab(targetTabId);
                         return { success: true, data: pageData };
                     } catch (e) {
                         return { success: false, error: e?.message || 'EXTRACTION_FAILED' };
@@ -999,19 +979,34 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 }
 
                 case 'tabs.uploadPreview': {
-                    const { nodeId, screenshotDataUrl, authHeader } = message;
+                    const { nodeId, screenshotDataUrl } = message;
+                    // authHeader comes from session — never from the caller
+                    const { wloSession } = await chrome.storage.local.get('wloSession');
+                    const authHeader = wloSession?.isValidLogin && wloSession?.authHeader ? wloSession.authHeader : null;
+                    if (!authHeader) return { success: false, error: 'NOT_LOGGED_IN' };
                     const ok = await uploadPreviewImage(nodeId, screenshotDataUrl, authHeader);
                     return { success: ok };
                 }
 
-                // Queue operations
                 case 'queue.get': {
                     const { queue = [] } = await chrome.storage.local.get('queue');
                     return { success: true, data: queue, queue };
                 }
                 case 'queue.add': {
+                    const data = message.data;
+                    if (!data || typeof data !== 'object' || !isAllowedUrl(data.url)) {
+                        return { success: false, error: 'INVALID_DATA' };
+                    }
                     const { queue = [] } = await chrome.storage.local.get('queue');
-                    const newItem = { id: message.data.id || generateId(), ...message.data, timestamp: message.data.timestamp || Date.now() };
+                    const newItem = {
+                        id: typeof data.id === 'string' ? data.id : generateId(),
+                        url: data.url,
+                        title: typeof data.title === 'string' ? data.title : data.url,
+                        favicon: sanitizeFaviconUrl(data.favicon),
+                        timestamp: typeof data.timestamp === 'number' ? data.timestamp : Date.now(),
+                        metadata: data.metadata && typeof data.metadata === 'object' ? data.metadata : {},
+                        extractedContent: data.extractedContent && typeof data.extractedContent === 'object' ? data.extractedContent : {}
+                    };
                     queue.push(newItem);
                     if (queue.length > MAX_QUEUE_SIZE) queue.splice(0, queue.length - MAX_QUEUE_SIZE);
                     await chrome.storage.local.set({ queue });
@@ -1033,7 +1028,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 }
                 case 'queue.search': {
                     const { queue = [] } = await chrome.storage.local.get('queue');
-                    const q = (message.query || '').toLowerCase();
+                    const q = typeof message.query === 'string' ? message.query.toLowerCase() : '';
                     if (!q) return { success: true, data: queue };
                     return { success: true, data: queue.filter(item => item.title?.toLowerCase().includes(q) || item.url?.toLowerCase().includes(q)) };
                 }
@@ -1042,14 +1037,54 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                     return { success: true, data: queue };
                 }
 
-                // History operations
+                case 'pendingItems.add': {
+                    const item = message.item;
+                    if (!item || typeof item !== 'object') return { success: false, error: 'INVALID_ITEM' };
+                    const { wkPendingItems = [] } = await chrome.storage.local.get('wkPendingItems');
+                    const sanitized = {
+                        id: typeof item.id === 'string' ? item.id : generateId(),
+                        nodeId: typeof item.nodeId === 'string' && /^[a-z0-9-]+$/i.test(item.nodeId) ? item.nodeId : '',
+                        title: typeof item.title === 'string' ? item.title.slice(0, 500) : '',
+                        url: typeof item.url === 'string' && /^https?:\/\//.test(item.url) ? item.url : '',
+                        type: typeof item.type === 'string' ? item.type.slice(0, 100) : '',
+                        typeId: typeof item.typeId === 'string' ? item.typeId.slice(0, 50) : '',
+                        thumbnail: typeof item.thumbnail === 'string' && /^https?:\/\//.test(item.thumbnail) ? item.thumbnail : '',
+                        author: typeof item.author === 'string' ? item.author.slice(0, 200) : '',
+                        description: typeof item.description === 'string' ? item.description.slice(0, 2000) : '',
+                        source: 'wlo-overlay',
+                        timestamp: Date.now()
+                    };
+                    wkPendingItems.push(sanitized);
+                    if (wkPendingItems.length > 200) wkPendingItems.splice(0, wkPendingItems.length - 200);
+                    await chrome.storage.local.set({ wkPendingItems });
+                    return { success: true };
+                }
+                case 'pendingItems.get': {
+                    const { wkPendingItems = [] } = await chrome.storage.local.get('wkPendingItems');
+                    return { success: true, data: wkPendingItems };
+                }
+                case 'pendingItems.clear': {
+                    await chrome.storage.local.set({ wkPendingItems: [] });
+                    return { success: true };
+                }
+
                 case 'history.get': {
                     const { history = [] } = await chrome.storage.local.get('history');
                     return { success: true, data: history };
                 }
                 case 'history.add': {
                     const { history = [] } = await chrome.storage.local.get('history');
-                    const newItem = { id: generateId(), ...message.data, timestamp: message.data.timestamp || Date.now() };
+                    const data = message.data || {};
+                    const newItem = {
+                        id: generateId(),
+                        url: typeof data.url === 'string' ? data.url : '',
+                        title: typeof data.title === 'string' ? data.title : '',
+                        favicon: sanitizeFaviconUrl(data.favicon),
+                        status: data.status === 'success' || data.status === 'error' ? data.status : 'error',
+                        isDuplicate: Boolean(data.isDuplicate),
+                        repoUrl: sanitizeRepoUrl(data.repoUrl),
+                        timestamp: typeof data.timestamp === 'number' ? data.timestamp : Date.now()
+                    };
                     history.unshift(newItem);
                     if (history.length > MAX_HISTORY_SIZE) history.splice(MAX_HISTORY_SIZE);
                     await chrome.storage.local.set({ history });
@@ -1069,7 +1104,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 }
                 case 'history.search': {
                     const { history = [] } = await chrome.storage.local.get('history');
-                    const q = (message.query || '').toLowerCase();
+                    const q = typeof message.query === 'string' ? message.query.toLowerCase() : '';
                     if (!q) return { success: true, data: history };
                     return { success: true, data: history.filter(i => i.title?.toLowerCase().includes(q) || i.url?.toLowerCase().includes(q)) };
                 }
@@ -1094,11 +1129,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 }
 
                 default:
-                    return { success: false, error: 'Unknown action: ' + message.action };
+                    return { success: false, error: 'UNKNOWN_ACTION' };
             }
         } catch (error) {
-            console.error('❌ Message handler error:', error);
-            return { success: false, error: error.message };
+            console.error('❌ Message handler error:', error?.message || error);
+            return { success: false, error: error?.message || 'INTERNAL_ERROR' };
         }
     };
 
@@ -1106,4 +1141,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
 });
 
-console.log('✅ Background Service Worker v8 initialized');
+function sanitizeRepoUrl(raw) {
+    if (typeof raw !== 'string') return '';
+    try {
+        const u = new URL(raw);
+        if (u.protocol !== 'https:') return '';
+        if (!ALLOWED_REPO_HOSTS.has(u.hostname)) return '';
+        return u.href;
+    } catch {
+        return '';
+    }
+}
+
+console.log('✅ Background Service Worker v9 initialized');

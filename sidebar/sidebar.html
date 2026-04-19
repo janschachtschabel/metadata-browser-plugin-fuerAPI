@@ -330,8 +330,8 @@
     <!-- Config zuerst laden (enthält API-URL etc.) -->
     <script src="../config.js"></script>
 
-    <!-- API-URL aus Config setzen BEVOR Angular bootet -->
-    <script>window.__ENV = { agentUrl: WLO_CONFIG.api.url };</script>
+    <!-- API-URL aus Config setzen BEVOR Angular bootet (externes Skript wegen strenger CSP) -->
+    <script src="init-env.js"></script>
 
     <!-- Web Component Scripts (Angular Elements — no iframe needed) -->
     <script src="../webcomponent/runtime.js"></script>

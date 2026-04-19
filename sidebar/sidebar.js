@@ -5,19 +5,35 @@ console.log('🎨 Sidebar v7 loaded (direct web component)');
 let REPOSITORY_URL = WLO_CONFIG.getRepositoryUrl();
 let API_URL = WLO_CONFIG.getApiUrl();
 
-// Custom URLs aus Options-Seite laden (überschreibt Config-Defaults)
+const ALLOWED_API_HOSTS = new Set(['metadata-agent-api.vercel.app']);
+const ALLOWED_REPO_HOSTS = new Set([
+    'repository.staging.openeduhub.net',
+    'redaktion.openeduhub.net'
+]);
+
+function sanitizeOrigin(rawUrl, allowedHosts) {
+    if (typeof rawUrl !== 'string') return null;
+    try {
+        const u = new URL(rawUrl);
+        if (u.protocol !== 'https:') return null;
+        if (!allowedHosts.has(u.hostname)) return null;
+        return u.origin;
+    } catch {
+        return null;
+    }
+}
+
+// Custom URLs aus Options-Seite laden (überschreibt Config-Defaults, nur whitelisted Hosts)
 async function loadCustomUrls() {
     try {
         const { customApiUrl, customRepositoryUrl } = await chrome.storage.local.get(['customApiUrl', 'customRepositoryUrl']);
-        if (customApiUrl) {
-            API_URL = customApiUrl;
-            window.__ENV = { agentUrl: customApiUrl };
-            console.log('🔧 Custom API URL from options:', customApiUrl);
+        const safeApi = customApiUrl ? sanitizeOrigin(customApiUrl, ALLOWED_API_HOSTS) : null;
+        const safeRepo = customRepositoryUrl ? sanitizeOrigin(customRepositoryUrl, ALLOWED_REPO_HOSTS) : null;
+        if (safeApi) {
+            API_URL = safeApi;
+            window.__ENV = { agentUrl: safeApi };
         }
-        if (customRepositoryUrl) {
-            REPOSITORY_URL = customRepositoryUrl;
-            console.log('🔧 Custom Repository URL from options:', customRepositoryUrl);
-        }
+        if (safeRepo) REPOSITORY_URL = safeRepo;
     } catch (e) { /* storage not available */ }
 }
 loadCustomUrls();
@@ -213,13 +229,18 @@ function switchView(viewName) {
 async function loadUserSession() {
     try {
         const { wloSession } = await chrome.storage.local.get('wloSession');
-        if (wloSession && wloSession.isValidLogin && !wloSession.isGuest) {
-            showLoggedInState(wloSession);
-        } else {
+        if (!wloSession || !wloSession.isValidLogin || wloSession.isGuest) {
             showGuestState();
+            return;
         }
+        if (typeof wloSession.expiresAt === 'number' && wloSession.expiresAt < Date.now()) {
+            await chrome.storage.local.remove('wloSession');
+            showGuestState();
+            return;
+        }
+        showLoggedInState(wloSession);
     } catch (error) {
-        console.error('❌ Load session failed:', error);
+        console.error('❌ Load session failed:', error?.message || error);
         showGuestState();
     }
 }
@@ -235,6 +256,18 @@ function showGuestState() {
     guestState.classList.remove('hidden');
 }
 
+const SESSION_TIMEOUT_MS = 8 * 60 * 60 * 1000; // 8 hours inactivity
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 20000) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        return await fetch(url, { ...options, signal: controller.signal });
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
 async function handleLogin(e) {
     e.preventDefault();
     const username = usernameInput.value.trim();
@@ -245,7 +278,7 @@ async function handleLogin(e) {
     try {
         const authHeader = 'Basic ' + btoa(username + ':' + password);
 
-        const response = await fetch(
+        const response = await fetchWithTimeout(
             `${REPOSITORY_URL}/edu-sharing/rest/authentication/v1/validateSession`,
             { method: 'GET', headers: { 'Authorization': authHeader, 'Accept': 'application/json' }, credentials: 'include' }
         );
@@ -255,28 +288,45 @@ async function handleLogin(e) {
         if (sessionData.isGuest || sessionData.statusCode === 'GUEST') throw new Error('Gast-Login ist nicht erlaubt.');
         if (!sessionData.isValidLogin || sessionData.statusCode !== 'OK') throw new Error('Ungültige Anmeldedaten');
 
-        const hasCreatePermission = sessionData.toolPermissions?.includes('TOOLPERMISSION_CREATE_ELEMENTS_FILES');
+        const hasCreatePermission = Array.isArray(sessionData.toolPermissions)
+            && sessionData.toolPermissions.includes('TOOLPERMISSION_CREATE_ELEMENTS_FILES');
         if (!hasCreatePermission) throw new Error('Keine Berechtigung zum Erstellen von Inhalten');
 
-        // Get User Home ID
-        const homeResponse = await fetch(
+        const homeResponse = await fetchWithTimeout(
             `${REPOSITORY_URL}/edu-sharing/rest/node/v1/nodes/-home-/-inbox-/metadata`,
             { headers: { 'Authorization': authHeader, 'Accept': 'application/json' }, credentials: 'include' }
         );
         if (!homeResponse.ok) throw new Error('Konnte User Home nicht abrufen');
         const homeData = await homeResponse.json();
-        const userHomeId = homeData.node?.ref?.id;
+        const userHomeId = typeof homeData?.node?.ref?.id === 'string' ? homeData.node.ref.id : null;
         if (!userHomeId) throw new Error('User Home ID nicht gefunden');
 
-        const sessionToSave = { ...sessionData, username, authHeader, userHomeId, loginTime: new Date().toISOString() };
+        // Store only the minimum needed: display name, home id, permission list (array of strings only),
+        // authHeader, and a session expiry timestamp.
+        const allowedPermissionPattern = /^[A-Z0-9_]+$/;
+        const filteredPermissions = Array.isArray(sessionData.toolPermissions)
+            ? sessionData.toolPermissions.filter(p => typeof p === 'string' && allowedPermissionPattern.test(p))
+            : [];
+
+        const now = Date.now();
+        const sessionToSave = {
+            username,
+            authorityName: typeof sessionData.authorityName === 'string' ? sessionData.authorityName : username,
+            toolPermissions: filteredPermissions,
+            isValidLogin: true,
+            isGuest: false,
+            userHomeId,
+            authHeader,
+            loginTime: now,
+            expiresAt: now + SESSION_TIMEOUT_MS
+        };
         await chrome.storage.local.set({ wloSession: sessionToSave });
 
         passwordInput.value = '';
         showLoggedInState(sessionToSave);
-        console.log('✅ Login successful');
     } catch (error) {
-        console.error('❌ Login failed:', error);
-        alert('Login fehlgeschlagen:\n\n' + error.message);
+        console.error('❌ Login failed:', error?.message || error);
+        alert('Login fehlgeschlagen:\n\n' + (error?.message || 'Unbekannter Fehler'));
     } finally {
         hideLoading();
     }
@@ -322,7 +372,7 @@ async function handleOpenCanvas() {
 
         showLoading('Seite wird analysiert...');
 
-        // Extract page data via content script
+        // Extract page data via on-demand content script injection
         let pageData = null;
         try {
             const extractResponse = await chrome.runtime.sendMessage({ action: 'tabs.extractPageData', tabId: tab.id });
@@ -330,28 +380,7 @@ async function handleOpenCanvas() {
                 pageData = extractResponse.data;
             }
         } catch (e) {
-            console.warn('⚠️ Content script extraction failed:', e);
-        }
-
-        // If extraction failed (e.g. content script not injected on pre-existing tab),
-        // inject it on-demand and retry
-        if (!pageData || !pageData.formattedText) {
-            console.log('🔄 Retrying: injecting content script on-demand...');
-            try {
-                await chrome.scripting.executeScript({
-                    target: { tabId: tab.id },
-                    files: ['content/content.js']
-                });
-                // Wait briefly for script to initialize
-                await new Promise(resolve => setTimeout(resolve, 300));
-                const retryResponse = await chrome.runtime.sendMessage({ action: 'tabs.extractPageData', tabId: tab.id });
-                if (retryResponse?.success && retryResponse.data) {
-                    pageData = retryResponse.data;
-                    console.log('✅ On-demand injection succeeded, got formattedText:', pageData.formattedText?.length || 0, 'chars');
-                }
-            } catch (retryError) {
-                console.warn('⚠️ On-demand content script injection failed:', retryError);
-            }
+            console.warn('⚠️ Content script extraction failed:', e?.message || e);
         }
 
         // Capture screenshot while the page is still visible (before switching to canvas)
@@ -375,7 +404,7 @@ async function handleOpenCanvas() {
             id: 'temp-' + Date.now(),
             url: pageData?.url || tab.url,
             title: pageData?.title || tab.title,
-            favicon: tab.favIconUrl || '',
+            favicon: safeImageUrl(tab.favIconUrl),
             timestamp: Date.now(),
             metadata: pageData || {},
             extractedContent: {
@@ -485,25 +514,14 @@ async function handleCanvasSaveMetadata(rawMetadata) {
             const repoUrl = nodeId ? `${REPOSITORY_URL}/edu-sharing/components/render/${nodeId}` : null;
             const favicon = await getFaviconForHistory();
 
-            // Upload screenshot as preview image (non-blocking)
+            // Upload screenshot as preview image (non-blocking).
+            // Background pulls authHeader from the stored session — we never forward it.
             if (screenshotDataUrl && nodeId) {
-                try {
-                    const { wloSession } = await chrome.storage.local.get('wloSession');
-                    const authHeader = wloSession?.authHeader;
-                    if (authHeader) {
-                        chrome.runtime.sendMessage({
-                            action: 'tabs.uploadPreview',
-                            nodeId,
-                            screenshotDataUrl,
-                            authHeader
-                        }).then(r => {
-                            if (r?.success) console.log('📸 Preview uploaded for', nodeId);
-                            else console.warn('⚠️ Preview upload response:', r);
-                        }).catch(e => console.warn('⚠️ Preview upload error:', e));
-                    }
-                } catch (e) {
-                    console.warn('⚠️ Preview upload skipped:', e);
-                }
+                chrome.runtime.sendMessage({
+                    action: 'tabs.uploadPreview',
+                    nodeId,
+                    screenshotDataUrl
+                }).catch(e => console.warn('⚠️ Preview upload error:', e?.message || e));
             }
 
             // Add to history
@@ -574,6 +592,164 @@ async function getFaviconForHistory() {
 }
 
 // ============================================================================
+// SAFE URL HELPERS & RENDERING
+// ============================================================================
+
+function safeImageUrl(raw) {
+    if (typeof raw !== 'string' || !raw) return '';
+    if (raw.startsWith('data:image/')) return raw; // data URLs for images are safe for <img src>
+    try {
+        const u = new URL(raw);
+        if (u.protocol === 'https:' || u.protocol === 'http:') return u.href;
+    } catch { /* fall through */ }
+    return '';
+}
+
+function safeLinkUrl(raw) {
+    if (typeof raw !== 'string' || !raw) return '';
+    try {
+        const u = new URL(raw);
+        if (u.protocol === 'https:' || u.protocol === 'http:') return u.href;
+    } catch { /* fall through */ }
+    return '';
+}
+
+function iconBtn(action, id, titleAttr, iconName) {
+    const btn = document.createElement('button');
+    btn.className = 'icon-btn';
+    btn.dataset.action = action;
+    btn.dataset.id = id;
+    btn.title = titleAttr;
+    const icon = document.createElement('span');
+    icon.className = 'material-icons';
+    icon.textContent = iconName;
+    btn.appendChild(icon);
+    return btn;
+}
+
+function faviconElement(favUrl, fallbackIcon) {
+    const safe = safeImageUrl(favUrl);
+    if (safe) {
+        const img = document.createElement('img');
+        img.src = safe;
+        img.className = 'item-favicon';
+        img.alt = '';
+        img.addEventListener('error', () => { img.style.display = 'none'; });
+        return img;
+    }
+    const span = document.createElement('span');
+    span.className = 'material-icons item-favicon';
+    span.style.fontSize = '32px';
+    span.style.color = 'var(--md-sys-color-primary,#003B7C)';
+    span.textContent = fallbackIcon;
+    return span;
+}
+
+function renderQueueCard(item) {
+    const card = document.createElement('div');
+    card.className = 'item-card';
+    card.dataset.id = item.id;
+
+    card.appendChild(faviconElement(item.favicon, 'bookmark'));
+
+    const content = document.createElement('div');
+    content.className = 'item-content';
+
+    const titleEl = document.createElement('div');
+    titleEl.className = 'item-title';
+    titleEl.textContent = item.title || '';
+
+    const urlEl = document.createElement('div');
+    urlEl.className = 'item-url';
+    urlEl.textContent = item.url || '';
+
+    const metaEl = document.createElement('div');
+    metaEl.className = 'item-meta';
+    metaEl.textContent = formatDate(item.timestamp);
+
+    content.append(titleEl, urlEl, metaEl);
+    card.appendChild(content);
+
+    const actions = document.createElement('div');
+    actions.className = 'item-actions';
+    actions.append(
+        iconBtn('process', item.id, 'Erschließen', 'play_arrow'),
+        iconBtn('open', item.id, 'Öffnen', 'open_in_new'),
+        iconBtn('delete', item.id, 'Entfernen', 'delete')
+    );
+    card.appendChild(actions);
+    return card;
+}
+
+function renderHistoryCard(item) {
+    const card = document.createElement('div');
+    card.className = 'item-card';
+    card.dataset.id = item.id;
+
+    const fallbackIcon = 'description';
+    card.appendChild(faviconElement(item.favicon, fallbackIcon));
+
+    const content = document.createElement('div');
+    content.className = 'item-content';
+
+    const titleEl = document.createElement('div');
+    titleEl.className = 'item-title';
+    titleEl.textContent = item.title || '';
+
+    const urlEl = document.createElement('div');
+    urlEl.className = 'item-url';
+    urlEl.textContent = item.url || '';
+
+    const metaEl = document.createElement('div');
+    metaEl.className = 'item-meta';
+
+    const statusSpan = document.createElement('span');
+    const statusClass = item.isDuplicate ? 'duplicate' : (item.status === 'success' ? 'success' : 'error');
+    statusSpan.className = `item-status status-${statusClass}`;
+    const statusIconName = item.status === 'success' ? 'check_circle' : (item.isDuplicate ? 'content_copy' : 'error');
+    const statusIcon = document.createElement('span');
+    statusIcon.className = 'material-icons';
+    statusIcon.style.fontSize = '16px';
+    statusIcon.textContent = statusIconName;
+    const statusText = document.createElement('span');
+    statusText.textContent = item.isDuplicate ? 'Duplikat' : (item.status === 'success' ? 'Erfolgreich' : 'Fehler');
+    statusSpan.append(statusIcon, statusText);
+
+    const dateSpan = document.createElement('span');
+    dateSpan.textContent = formatDate(item.timestamp);
+
+    metaEl.append(statusSpan, dateSpan);
+    content.append(titleEl, urlEl, metaEl);
+
+    const safeRepoUrl = safeLinkUrl(item.repoUrl);
+    if (safeRepoUrl) {
+        const link = document.createElement('a');
+        link.href = safeRepoUrl;
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
+        link.className = 'btn-text';
+        link.style.cssText = 'font-size:12px;padding:4px 8px;margin-top:4px;';
+        const linkIcon = document.createElement('span');
+        linkIcon.className = 'material-icons';
+        linkIcon.style.fontSize = '16px';
+        linkIcon.textContent = 'open_in_new';
+        const linkText = document.createElement('span');
+        linkText.textContent = 'Im Repository öffnen';
+        link.append(linkIcon, linkText);
+        content.appendChild(link);
+    }
+
+    card.appendChild(content);
+
+    const actions = document.createElement('div');
+    actions.className = 'item-actions';
+    actions.appendChild(iconBtn('delete', item.id, 'Entfernen', 'delete'));
+    card.appendChild(actions);
+
+    return card;
+}
+
+// ============================================================================
 // QUEUE MANAGEMENT
 // ============================================================================
 
@@ -608,30 +784,7 @@ async function loadQueue(searchQuery = '') {
         queueEmpty.classList.add('hidden');
         queueContent?.classList.remove('hidden');
 
-        queueList.innerHTML = queue.map(item => `
-            <div class="item-card" data-id="${item.id}">
-                ${item.favicon
-                    ? `<img src="${item.favicon}" class="item-favicon" onerror="this.style.display='none'">`
-                    : '<span class="material-icons item-favicon" style="font-size:32px;color:var(--md-sys-color-primary,#003B7C);">bookmark</span>'}
-                <div class="item-content">
-                    <div class="item-title">${escapeHtml(item.title)}</div>
-                    <div class="item-url">${escapeHtml(item.url)}</div>
-                    <div class="item-meta">${formatDate(item.timestamp)}</div>
-                </div>
-                <div class="item-actions">
-                    <button class="icon-btn" data-action="process" data-id="${item.id}" title="Erschließen">
-                        <span class="material-icons">play_arrow</span>
-                    </button>
-                    <button class="icon-btn" data-action="open" data-id="${item.id}" title="Öffnen">
-                        <span class="material-icons">open_in_new</span>
-                    </button>
-                    <button class="icon-btn" data-action="delete" data-id="${item.id}" title="Entfernen">
-                        <span class="material-icons">delete</span>
-                    </button>
-                </div>
-            </div>
-        `).join('');
-
+        queueList.replaceChildren(...queue.map(item => renderQueueCard(item)));
         queueList.querySelectorAll('[data-action]').forEach(btn => {
             btn.addEventListener('click', handleQueueItemAction);
         });
@@ -749,45 +902,12 @@ async function loadHistory(searchQuery = '') {
         historyEmpty.classList.add('hidden');
         historyContent?.classList.remove('hidden');
 
-        historyList.innerHTML = history.map(item => {
-            const statusIcon = item.status === 'success' ? 'check_circle' : item.isDuplicate ? 'content_copy' : 'error';
-            const statusText = item.isDuplicate ? 'Duplikat' : item.status === 'success' ? 'Erfolgreich' : 'Fehler';
-            const statusClass = item.isDuplicate ? 'duplicate' : item.status;
-
-            return `
-                <div class="item-card" data-id="${item.id}">
-                    ${item.favicon
-                        ? `<img src="${item.favicon}" class="item-favicon" onerror="this.style.display='none'">`
-                        : '<span class="material-icons item-favicon" style="font-size:32px;color:var(--md-sys-color-primary,#003B7C);">description</span>'}
-                    <div class="item-content">
-                        <div class="item-title">${escapeHtml(item.title)}</div>
-                        <div class="item-url">${escapeHtml(item.url)}</div>
-                        <div class="item-meta">
-                            <span class="item-status status-${statusClass}">
-                                <span class="material-icons" style="font-size:16px;">${statusIcon}</span>
-                                <span>${statusText}</span>
-                            </span>
-                            <span>${formatDate(item.timestamp)}</span>
-                        </div>
-                        ${item.repoUrl ? `<a href="${item.repoUrl}" target="_blank" class="btn-text" style="font-size:12px;padding:4px 8px;margin-top:4px;">
-                            <span class="material-icons" style="font-size:16px;">open_in_new</span>
-                            <span>Im Repository öffnen</span>
-                        </a>` : ''}
-                    </div>
-                    <div class="item-actions">
-                        <button class="icon-btn" data-action="delete" data-id="${item.id}" title="Entfernen">
-                            <span class="material-icons">delete</span>
-                        </button>
-                    </div>
-                </div>
-            `;
-        }).join('');
-
+        historyList.replaceChildren(...history.map(item => renderHistoryCard(item)));
         historyList.querySelectorAll('[data-action]').forEach(btn => {
             btn.addEventListener('click', async (e) => {
                 const itemId = e.currentTarget.dataset.id;
-                const { history = [] } = await chrome.storage.local.get('history');
-                const filtered = history.filter(i => i.id !== itemId);
+                const { history: current = [] } = await chrome.storage.local.get('history');
+                const filtered = current.filter(i => i.id !== itemId);
                 await chrome.storage.local.set({ history: filtered });
                 loadHistory();
             });
@@ -802,15 +922,29 @@ async function loadHistory(searchQuery = '') {
 async function loadHistoryStats() {
     const response = await chrome.runtime.sendMessage({ action: 'history.stats' });
     if (!response.success) return;
-    const stats = response.data;
+    const stats = response.data || {};
     const statsRow = document.getElementById('history-stats');
+    if (!statsRow) return;
 
-    statsRow.innerHTML = `
-        <div class="stat-card"><div class="stat-value">${stats.total}</div><div class="stat-label">Gesamt</div></div>
-        <div class="stat-card"><div class="stat-value">${stats.success}</div><div class="stat-label">Erfolgreich</div></div>
-        <div class="stat-card"><div class="stat-value">${stats.duplicates}</div><div class="stat-label">Duplikate</div></div>
-        <div class="stat-card"><div class="stat-value">${stats.errors}</div><div class="stat-label">Fehler</div></div>
-    `;
+    const makeCard = (value, label) => {
+        const card = document.createElement('div');
+        card.className = 'stat-card';
+        const v = document.createElement('div');
+        v.className = 'stat-value';
+        v.textContent = String(Number(value) || 0);
+        const l = document.createElement('div');
+        l.className = 'stat-label';
+        l.textContent = label;
+        card.append(v, l);
+        return card;
+    };
+
+    statsRow.replaceChildren(
+        makeCard(stats.total, 'Gesamt'),
+        makeCard(stats.success, 'Erfolgreich'),
+        makeCard(stats.duplicates, 'Duplikate'),
+        makeCard(stats.errors, 'Fehler')
+    );
 }
 
 function setupHistoryEventListeners() {
@@ -833,24 +967,30 @@ function setupHistoryEventListeners() {
 // SUCCESS & ERROR MODALS
 // ============================================================================
 
+function buildStaticModalFromTemplate(templateHtml) {
+    const modal = document.createElement('div');
+    modal.className = 'success-modal-overlay';
+    const range = document.createRange();
+    range.selectNode(document.body);
+    modal.appendChild(range.createContextualFragment(templateHtml));
+    return modal;
+}
+
 function showSuccessModal(response) {
-    if (!response?.nodeId) return;
+    if (!response || typeof response.nodeId !== 'string' || !response.nodeId) return;
     const nodeId = response.nodeId;
-    const mode = response.mode || 'guest';
-    const title = response.title || 'Unbekannt';
-    const nodeUrl = `${REPOSITORY_URL}/edu-sharing/components/render/${nodeId}`;
+    const mode = response.mode === 'user' ? 'user' : 'guest';
+    const nodeUrl = `${REPOSITORY_URL}/edu-sharing/components/render/${encodeURIComponent(nodeId)}`;
     const modeText = mode === 'user' ? 'Benutzer-Upload' : 'Gast-Upload (Prüfung erforderlich)';
     const subtitle = mode === 'user' ? 'Ins Repository hochgeladen' : 'Zur Prüfung eingereicht';
 
-    const modal = document.createElement('div');
-    modal.className = 'success-modal-overlay';
-    modal.innerHTML = `
+    const modal = buildStaticModalFromTemplate(`
         <div class="success-modal">
             <button class="modal-close-x">✕</button>
             <div class="modal-icon success">✓</div>
             <h2 class="modal-title">Erfolgreich gespeichert!</h2>
-            <p class="modal-subtitle">${subtitle}</p>
-            <div class="modal-badge">${mode === 'user' ? '🔐' : '🔓'} ${modeText}</div>
+            <p class="modal-subtitle"></p>
+            <div class="modal-badge"></div>
             <div class="modal-buttons">
                 <button class="btn btn-primary modal-view-btn">
                     <span class="material-icons">open_in_new</span>
@@ -862,21 +1002,22 @@ function showSuccessModal(response) {
                 </button>
             </div>
         </div>
-    `;
+    `);
+    modal.querySelector('.modal-subtitle').textContent = subtitle;
+    modal.querySelector('.modal-badge').textContent = `${mode === 'user' ? '🔐' : '🔓'} ${modeText}`;
+
     document.body.appendChild(modal);
     modal.querySelector('.modal-close-x').addEventListener('click', () => modal.remove());
     modal.querySelector('.modal-close-btn').addEventListener('click', () => modal.remove());
-    modal.querySelector('.modal-view-btn').addEventListener('click', () => { window.open(nodeUrl, '_blank'); modal.remove(); });
+    modal.querySelector('.modal-view-btn').addEventListener('click', () => { window.open(nodeUrl, '_blank', 'noopener,noreferrer'); modal.remove(); });
     modal.addEventListener('click', (e) => { if (e.target === modal) modal.remove(); });
 }
 
 function showDuplicateModal(existingNode) {
-    if (!existingNode) return;
-    const nodeUrl = `${REPOSITORY_URL}/edu-sharing/components/render/${existingNode.id}`;
+    if (!existingNode || typeof existingNode.id !== 'string' || !existingNode.id) return;
+    const nodeUrl = `${REPOSITORY_URL}/edu-sharing/components/render/${encodeURIComponent(existingNode.id)}`;
 
-    const modal = document.createElement('div');
-    modal.className = 'success-modal-overlay';
-    modal.innerHTML = `
+    const modal = buildStaticModalFromTemplate(`
         <div class="success-modal">
             <button class="modal-close-x">✕</button>
             <div class="modal-icon warning">⚠</div>
@@ -884,7 +1025,7 @@ function showDuplicateModal(existingNode) {
             <p class="modal-subtitle">Diese URL ist bereits im Repository</p>
             <div class="modal-info">
                 <div class="info-label">Titel</div>
-                <div class="info-value">${escapeHtml(existingNode.title || 'Unbekannt')}</div>
+                <div class="info-value"></div>
             </div>
             <div class="modal-buttons">
                 <button class="btn btn-primary modal-view-btn">
@@ -897,11 +1038,13 @@ function showDuplicateModal(existingNode) {
                 </button>
             </div>
         </div>
-    `;
+    `);
+    modal.querySelector('.info-value').textContent = typeof existingNode.title === 'string' ? existingNode.title : 'Unbekannt';
+
     document.body.appendChild(modal);
     modal.querySelector('.modal-close-x').addEventListener('click', () => modal.remove());
     modal.querySelector('.modal-close-btn').addEventListener('click', () => modal.remove());
-    modal.querySelector('.modal-view-btn').addEventListener('click', () => { window.open(nodeUrl, '_blank'); modal.remove(); });
+    modal.querySelector('.modal-view-btn').addEventListener('click', () => { window.open(nodeUrl, '_blank', 'noopener,noreferrer'); modal.remove(); });
     modal.addEventListener('click', (e) => { if (e.target === modal) modal.remove(); });
 }
 

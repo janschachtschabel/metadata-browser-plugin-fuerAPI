@@ -1,32 +1,31 @@
 {
   "manifest_version": 3,
   "name": "WLO Metadaten-Agent",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "KI-gestützte Metadaten-Erfassung für WirLernenOnline — mit integrierter Webkomponente und FastAPI-Backend.",
   "homepage_url": "https://wirlernenonline.de/",
-  
+
   "icons": {
     "16": "icons/16.png",
     "32": "icons/32.png",
     "48": "icons/48.png",
     "128": "icons/128.png"
   },
-  
+
   "permissions": [
     "activeTab",
+    "tabs",
     "scripting",
     "storage",
-    "unlimitedStorage",
     "notifications",
     "sidePanel",
     "contextMenus"
   ],
-  
+
   "host_permissions": [
-    "https://*/*",
-    "http://*/*"
+    "https://*/*"
   ],
-  
+
   "action": {
     "default_icon": {
       "16": "icons/16.png",
@@ -36,21 +35,16 @@
     },
     "default_title": "WLO Metadaten-Agent"
   },
-  
+
   "side_panel": {
     "default_path": "sidebar/sidebar.html"
   },
-  
+
   "background": {
     "service_worker": "background/background.js"
   },
-  
+
   "content_scripts": [
-    {
-      "matches": ["<all_urls>"],
-      "js": ["content/content.js"],
-      "run_at": "document_idle"
-    },
     {
       "matches": [
         "https://suche.wirlernenonline.de/*",
@@ -69,17 +63,20 @@
       "run_at": "document_idle"
     }
   ],
-  
+
   "options_page": "options/options.html",
-  
+
   "web_accessible_resources": [
     {
-      "resources": ["icons/*", "images/*", "webcomponent/*", "config.js"],
-      "matches": ["<all_urls>"]
+      "resources": ["webcomponent/*"],
+      "matches": [
+        "https://suche.wirlernenonline.de/*",
+        "https://*.wirlernenonline.de/*"
+      ]
     }
   ],
 
   "content_security_policy": {
-    "extension_pages": "script-src 'self'; object-src 'self';"
+    "extension_pages": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https:; connect-src 'self' https://metadata-agent-api.vercel.app https://repository.staging.openeduhub.net https://redaktion.openeduhub.net https://*.wirlernenonline.de; frame-ancestors 'none'; object-src 'none'; base-uri 'self'; form-action 'self'"
   }
 }
